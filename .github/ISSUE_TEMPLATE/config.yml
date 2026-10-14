@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/pcmbezerra/PRDC/security/advisories/new
+    about: Report vulnerabilities privately. Do not disclose credentials or private RDG data in public issues.
+  - name: Documentation
+    url: https://github.com/pcmbezerra/PRDC#readme
+    about: Review requirements, usage, compatibility, and development guidance.

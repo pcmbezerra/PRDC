@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose a focused improvement to PRDC
+title: "[Feature] "
+labels: [enhancement, triage]
+body:
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and pull requests for a related proposal.
+          required: true
+        - label: This request contains no credentials, private RDG data, or internal hosts.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Current limitation
+      description: What are you trying to do, and what is difficult today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable result. Implementation details are optional.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - RDG file handling
+        - Groups and servers
+        - RDP connection
+        - User interface or theme
+        - Build or packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and compatibility
+      description: Note affected Windows versions, RDG settings, security boundaries, or non-goals when known.
