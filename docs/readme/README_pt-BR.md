@@ -28,6 +28,9 @@ O PRDC organiza endpoints de Área de Trabalho Remota em arquivos `.rdg` compat�
 - Criar, abrir, editar e salvar arquivos `.rdg`.
 - Organizar servidores em grupos aninhados.
 - Conectar e desconectar uma sessão RDP incorporada por vez.
+- Exibir na árvore os estados desconectado, conectando, conectado e login concluído.
+- Manter uma miniatura atualizada da sessão remota ativa na tela de detalhes.
+- Redimensionar automaticamente a resolução remota junto com a janela do aplicativo.
 - Usar os diálogos nativos de credenciais e certificados do Windows.
 - Habilitar CredSSP, autenticação do servidor, clipboard e Smart Sizing.
 - Acompanhar automaticamente o tema claro ou escuro do Windows.

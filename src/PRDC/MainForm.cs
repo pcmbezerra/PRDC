@@ -22,6 +22,23 @@ internal sealed class MainForm : Form
     };
     private readonly Label _nodeType = new() { AutoSize = true };
     private readonly Label _nodeHost = new() { AutoSize = true };
+    private readonly Label _connectionState = new() { AutoSize = true };
+    private readonly Label _thumbnailTitle = new()
+    {
+        AutoSize = true,
+        Font = new Font(SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont, FontStyle.Bold),
+        Margin = new Padding(0, 18, 0, 6),
+        Text = "Miniatura da sessão"
+    };
+    private readonly PictureBox _thumbnail = new()
+    {
+        BackColor = Color.Black,
+        BorderStyle = BorderStyle.FixedSingle,
+        Size = new Size(640, 360),
+        SizeMode = PictureBoxSizeMode.CenterImage
+    };
+    private readonly Label _thumbnailStatus = new() { AutoSize = true, Text = "Sem sessão ativa." };
+    private readonly System.Windows.Forms.Timer _thumbnailTimer = new() { Interval = 1000 };
     private readonly ToolStripStatusLabel _statusLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
     private readonly ToolStripMenuItem _saveMenuItem = new("&Salvar");
     private readonly ToolStripMenuItem _saveAsMenuItem = new("Salvar &como...");
@@ -44,6 +61,8 @@ internal sealed class MainForm : Form
     };
     private RdgDocument _document = RdgDocument.CreateNew();
     private RdpClientHost? _rdpHost;
+    private XElement? _activeServerElement;
+    private Bitmap? _latestThumbnail;
     private bool _populatingTree;
 
     public MainForm()
@@ -65,8 +84,10 @@ internal sealed class MainForm : Form
         _tree.AfterCollapse += (_, eventArgs) => UpdateExpanded(eventArgs.Node, false);
         _tree.NodeMouseDoubleClick += (_, _) => ActivateSelectedNode();
         _tree.ContextMenuStrip = BuildContextMenu();
+        _thumbnailTimer.Tick += (_, _) => UpdateThumbnail();
 
         FormClosing += OnFormClosing;
+        FormClosed += OnFormClosed;
         PopulateTree();
         UpdateTitle();
         SetStatus("Pronto.");
@@ -168,6 +189,10 @@ internal sealed class MainForm : Form
         detailLayout.Controls.Add(_nodeTitle);
         detailLayout.Controls.Add(_nodeType);
         detailLayout.Controls.Add(_nodeHost);
+        detailLayout.Controls.Add(_connectionState);
+        detailLayout.Controls.Add(_thumbnailTitle);
+        detailLayout.Controls.Add(_thumbnail);
+        detailLayout.Controls.Add(_thumbnailStatus);
         details.Controls.Add(detailLayout);
 
         TabPage detailsPage = new("Detalhes") { Padding = new Padding(3) };
@@ -380,6 +405,8 @@ internal sealed class MainForm : Form
             }
 
             _sessionPage.Text = $"Sessão - {server.Name}";
+            _activeServerElement = server.Element;
+            UpdateConnectionViews();
             _rdpHost.ConnectTo(server.HostName);
             UpdateCommands();
         }
@@ -427,9 +454,19 @@ internal sealed class MainForm : Form
         SetStatus(eventArgs.Message);
         if (eventArgs.State == RdpConnectionState.Disconnected)
         {
+            _thumbnailTimer.Stop();
+            ClearThumbnail();
+            _activeServerElement = null;
             _sessionPage.Text = "Sessão";
         }
+        else if (eventArgs.State is RdpConnectionState.Connected or RdpConnectionState.LoggedIn)
+        {
+            SelectActiveServer();
+            UpdateThumbnail();
+            _thumbnailTimer.Start();
+        }
 
+        UpdateConnectionViews();
         UpdateCommands();
     }
 
@@ -488,7 +525,7 @@ internal sealed class MainForm : Form
 
     private TreeNode CreateTreeNode(RdgNode node)
     {
-        TreeNode treeNode = new(node.Name) { Tag = node };
+        TreeNode treeNode = new(GetTreeNodeText(node)) { Tag = node };
         foreach (RdgNode child in node.Children)
         {
             treeNode.Nodes.Add(CreateTreeNode(child));
@@ -558,6 +595,31 @@ internal sealed class MainForm : Form
             _ => string.Empty
         };
         _nodeHost.Text = node?.Kind == RdgNodeKind.Server ? $"Host: {node.HostName}" : string.Empty;
+        bool isServer = node?.Kind == RdgNodeKind.Server;
+        RdpConnectionState state = isServer ? GetConnectionState(node!) : RdpConnectionState.Disconnected;
+        _connectionState.Visible = isServer;
+        _connectionState.Text = isServer ? $"Estado: {GetConnectionStateText(state)}" : string.Empty;
+        bool hasActiveSession = _activeServerElement is not null
+            && _rdpHost?.ConnectionState is
+                RdpConnectionState.Connecting or RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
+        bool showThumbnail = isServer || hasActiveSession;
+        _thumbnailTitle.Visible = showThumbnail;
+        _thumbnail.Visible = showThumbnail;
+        _thumbnailStatus.Visible = showThumbnail;
+        _thumbnailTitle.Text = hasActiveSession
+            ? $"Miniatura da sessão ativa - {_rdpHost!.Server}"
+            : "Miniatura da sessão";
+        _thumbnail.Image = hasActiveSession ? _latestThumbnail : null;
+        _thumbnailStatus.Text = hasActiveSession
+            ? _rdpHost!.ConnectionState switch
+            {
+                RdpConnectionState.Connecting => "Aguardando a conexão para gerar a miniatura.",
+                RdpConnectionState.Connected or RdpConnectionState.LoggedIn when _latestThumbnail is null =>
+                    "Capturando a sessão remota...",
+                RdpConnectionState.Connected or RdpConnectionState.LoggedIn => "Atualizada automaticamente a cada segundo.",
+                _ => "Sem sessão ativa."
+            }
+            : isServer ? "Sem sessão ativa para este servidor." : string.Empty;
         UpdateCommands();
     }
 
@@ -569,7 +631,8 @@ internal sealed class MainForm : Form
         _addServerMenuItem.Enabled = container;
         _editMenuItem.Enabled = selected is not null;
         _removeMenuItem.Enabled = selected is { Kind: not RdgNodeKind.File };
-        bool sessionActive = _rdpHost?.ConnectionState is RdpConnectionState.Connecting or RdpConnectionState.Connected;
+        bool sessionActive = _rdpHost?.ConnectionState is
+            RdpConnectionState.Connecting or RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
         _connectMenuItem.Enabled = selected?.Kind == RdgNodeKind.Server && !sessionActive;
         _disconnectMenuItem.Enabled = sessionActive;
         _connectButton.Enabled = _connectMenuItem.Enabled;
@@ -611,7 +674,8 @@ internal sealed class MainForm : Form
 
     private bool ConfirmDisconnectSession()
     {
-        if (_rdpHost?.ConnectionState is not (RdpConnectionState.Connecting or RdpConnectionState.Connected))
+        if (_rdpHost?.ConnectionState is not (
+            RdpConnectionState.Connecting or RdpConnectionState.Connected or RdpConnectionState.LoggedIn))
         {
             return true;
         }
@@ -641,6 +705,106 @@ internal sealed class MainForm : Form
         }
 
         DisconnectSession();
+    }
+
+    private void OnFormClosed(object? sender, FormClosedEventArgs eventArgs)
+    {
+        _thumbnailTimer.Dispose();
+        ClearThumbnail();
+    }
+
+    private void UpdateConnectionViews()
+    {
+        UpdateTreeConnectionStates(_tree.Nodes);
+        UpdateSelection();
+    }
+
+    private void SelectActiveServer()
+    {
+        if (_activeServerElement is null)
+        {
+            return;
+        }
+
+        TreeNode? activeServer = FindTreeNode(_tree.Nodes, _activeServerElement);
+        if (activeServer is null || ReferenceEquals(_tree.SelectedNode, activeServer))
+        {
+            return;
+        }
+
+        _tree.SelectedNode = activeServer;
+        activeServer.EnsureVisible();
+    }
+
+    private void UpdateTreeConnectionStates(TreeNodeCollection nodes)
+    {
+        foreach (TreeNode treeNode in nodes)
+        {
+            if (treeNode.Tag is RdgNode node)
+            {
+                treeNode.Text = GetTreeNodeText(node);
+            }
+
+            UpdateTreeConnectionStates(treeNode.Nodes);
+        }
+    }
+
+    private string GetTreeNodeText(RdgNode node)
+    {
+        return node.Kind == RdgNodeKind.Server
+            ? $"{node.Name} [{GetConnectionStateText(GetConnectionState(node))}]"
+            : node.Name;
+    }
+
+    private RdpConnectionState GetConnectionState(RdgNode server)
+    {
+        return IsActiveServer(server)
+            ? _rdpHost?.ConnectionState ?? RdpConnectionState.Disconnected
+            : RdpConnectionState.Disconnected;
+    }
+
+    private bool IsActiveServer(RdgNode server)
+    {
+        return _activeServerElement is not null && ReferenceEquals(server.Element, _activeServerElement);
+    }
+
+    private static string GetConnectionStateText(RdpConnectionState state)
+    {
+        return state switch
+        {
+            RdpConnectionState.Connecting => "Conectando",
+            RdpConnectionState.Connected => "Conectado",
+            RdpConnectionState.LoggedIn => "Login concluído",
+            _ => "Desconectado"
+        };
+    }
+
+    private void UpdateThumbnail()
+    {
+        if (_rdpHost?.ConnectionState is not (RdpConnectionState.Connected or RdpConnectionState.LoggedIn))
+        {
+            return;
+        }
+
+        Bitmap? thumbnail = _rdpHost.CaptureThumbnail(_thumbnail.ClientSize);
+        if (thumbnail is null)
+        {
+            return;
+        }
+
+        Bitmap? previous = _latestThumbnail;
+        _latestThumbnail = thumbnail;
+        _thumbnail.Image = thumbnail;
+        _thumbnailStatus.Text = "Atualizada automaticamente a cada segundo.";
+
+        previous?.Dispose();
+    }
+
+    private void ClearThumbnail()
+    {
+        _thumbnail.Image = null;
+        _latestThumbnail?.Dispose();
+        _latestThumbnail = null;
     }
 
     private void MarkChanged(string status)

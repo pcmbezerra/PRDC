@@ -28,6 +28,9 @@ PRDC organizes Remote Desktop endpoints in RDCMan-compatible `.rdg` files and op
 - Create, open, edit, and save `.rdg` files.
 - Organize servers into nested groups.
 - Connect and disconnect one embedded RDP session at a time.
+- Show disconnected, connecting, connected, and logged-in states in the server tree.
+- Keep a live thumbnail of the active remote session in the details view.
+- Resize the remote desktop resolution automatically with the application window.
 - Use the native Windows credential and certificate dialogs.
 - Enable CredSSP, server authentication, clipboard redirection, and smart sizing.
 - Follow the Windows light or dark application theme automatically.

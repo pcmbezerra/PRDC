@@ -16,7 +16,9 @@ The original XML document remains authoritative. Unknown elements are not normal
 
 ## RDP session host
 
-`RdpClientHost` embeds the Windows `MsRdpClient10NotSafeForScripting` ActiveX control through `AxHost`. It configures the selected server and supported advanced settings, invokes connect/disconnect, and polls the control's native connection state.
+`RdpClientHost` embeds the Windows `MsRdpClient10NotSafeForScripting` ActiveX control through `AxHost`. It configures the selected server and supported advanced settings, invokes connect/disconnect, and consumes `IMsTscAxEvents` to distinguish transport connection from completed login. Polling the control's native connection state remains as a fallback. Window resize events are debounced before `UpdateSessionDisplaySettings` updates the remote desktop resolution; Smart Sizing remains the compatibility fallback.
+
+`MainForm` associates the active session with its RDG server node, updates the state shown in the tree, and refreshes a thumbnail of the ActiveX surface once per second while connected.
 
 PRDC does not implement the RDP protocol and does not store a plaintext password. Network, authentication, certificates, and remote-session rendering remain owned by the Windows control.
 

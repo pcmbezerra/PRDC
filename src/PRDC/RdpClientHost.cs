@@ -8,7 +8,8 @@ internal enum RdpConnectionState
 {
     Disconnected,
     Connecting,
-    Connected
+    Connected,
+    LoggedIn
 }
 
 internal sealed class RdpConnectionStateChangedEventArgs(
@@ -23,14 +24,22 @@ internal sealed class RdpConnectionStateChangedEventArgs(
 internal sealed class RdpClientHost : AxHost
 {
     private const string MsRdpClient10NotSafeClassId = "A0C63C30-F08D-4AB4-907C-34905D770C7D";
+    private const uint PrintWindowRenderFullContent = 0x00000002;
+    private const int MinimumSessionDimension = 200;
     private readonly System.Windows.Forms.Timer _stateTimer = new() { Interval = 250 };
+    private readonly System.Windows.Forms.Timer _resizeTimer = new() { Interval = 250 };
+    private ConnectionPointCookie? _eventCookie;
+    private RdpClientEventSink? _eventSink;
     private object? _client;
     private bool _connectionRequested;
+    private string _lastStateMessage = string.Empty;
+    private Size _lastSessionSize;
 
     public RdpClientHost() : base(MsRdpClient10NotSafeClassId)
     {
         Dock = DockStyle.Fill;
         _stateTimer.Tick += (_, _) => PollState();
+        _resizeTimer.Tick += (_, _) => ApplySessionSize();
     }
 
     public event EventHandler<RdpConnectionStateChangedEventArgs>? ConnectionStateChanged;
@@ -38,6 +47,42 @@ internal sealed class RdpClientHost : AxHost
     public RdpConnectionState ConnectionState { get; private set; }
 
     public string Server { get; private set; } = string.Empty;
+
+    public Bitmap? CaptureThumbnail(Size maximumSize)
+    {
+        if (ConnectionState is RdpConnectionState.Disconnected or RdpConnectionState.Connecting
+            || !IsHandleCreated
+            || ClientSize.Width <= 0
+            || ClientSize.Height <= 0
+            || maximumSize.Width <= 0
+            || maximumSize.Height <= 0)
+        {
+            return null;
+        }
+
+        using Bitmap source = new(ClientSize.Width, ClientSize.Height);
+        using (Graphics graphics = Graphics.FromImage(source))
+        {
+            IntPtr hdc = graphics.GetHdc();
+            try
+            {
+                if (!PrintWindow(Handle, hdc, PrintWindowRenderFullContent))
+                {
+                    return null;
+                }
+            }
+            finally
+            {
+                graphics.ReleaseHdc(hdc);
+            }
+        }
+
+        Size thumbnailSize = FitInside(source.Size, maximumSize);
+        Bitmap thumbnail = new(thumbnailSize.Width, thumbnailSize.Height);
+        using Graphics target = Graphics.FromImage(thumbnail);
+        target.DrawImage(source, new Rectangle(Point.Empty, thumbnailSize));
+        return thumbnail;
+    }
 
     public void ConnectTo(string server)
     {
@@ -50,10 +95,11 @@ internal sealed class RdpClientHost : AxHost
 
         object client = EnsureClient();
         Server = server.Trim();
+        Size sessionSize = GetSessionSize();
 
         SetProperty(client, "Server", Server);
-        SetProperty(client, "DesktopWidth", Math.Max(800, ClientSize.Width));
-        SetProperty(client, "DesktopHeight", Math.Max(600, ClientSize.Height));
+        SetProperty(client, "DesktopWidth", sessionSize.Width);
+        SetProperty(client, "DesktopHeight", sessionSize.Height);
         SetProperty(client, "ColorDepth", 32);
         SetOptionalProperty(client, "ConnectingText", $"Conectando a {Server}...");
         SetOptionalProperty(client, "ConnectedStatusText", $"Conectado a {Server}");
@@ -69,6 +115,7 @@ internal sealed class RdpClientHost : AxHost
         }
 
         _connectionRequested = true;
+        _lastSessionSize = sessionSize;
         SetState(RdpConnectionState.Connecting, $"Conectando a {Server}...");
 
         try
@@ -87,6 +134,7 @@ internal sealed class RdpClientHost : AxHost
     public void DisconnectSession()
     {
         _stateTimer.Stop();
+        _resizeTimer.Stop();
 
         if (_client is not null)
         {
@@ -98,7 +146,19 @@ internal sealed class RdpClientHost : AxHost
         }
 
         _connectionRequested = false;
+        _lastSessionSize = Size.Empty;
         SetState(RdpConnectionState.Disconnected, "Sessão RDP desconectada.");
+    }
+
+    protected override void OnSizeChanged(EventArgs e)
+    {
+        base.OnSizeChanged(e);
+
+        if (ConnectionState is RdpConnectionState.Connected or RdpConnectionState.LoggedIn)
+        {
+            _resizeTimer.Stop();
+            _resizeTimer.Start();
+        }
     }
 
     protected override void Dispose(bool disposing)
@@ -106,6 +166,7 @@ internal sealed class RdpClientHost : AxHost
         if (disposing)
         {
             _stateTimer.Stop();
+            _resizeTimer.Stop();
 
             try
             {
@@ -117,9 +178,27 @@ internal sealed class RdpClientHost : AxHost
             }
 
             _stateTimer.Dispose();
+            _resizeTimer.Dispose();
         }
 
         base.Dispose(disposing);
+    }
+
+    protected override void CreateSink()
+    {
+        base.CreateSink();
+        _eventSink = new RdpClientEventSink(this);
+        object client = GetOcx() ?? throw new InvalidOperationException(
+            "Não foi possível associar os eventos do controle RDP do Windows.");
+        _eventCookie = new ConnectionPointCookie(client, _eventSink, typeof(IRdpClientEvents));
+    }
+
+    protected override void DetachSink()
+    {
+        _eventCookie?.Disconnect();
+        _eventCookie = null;
+        _eventSink = null;
+        base.DetachSink();
     }
 
     private object EnsureClient()
@@ -142,6 +221,7 @@ internal sealed class RdpClientHost : AxHost
             int nativeState = ReadNativeState();
             RdpConnectionState state = nativeState switch
             {
+                1 when ConnectionState == RdpConnectionState.LoggedIn => RdpConnectionState.LoggedIn,
                 1 => RdpConnectionState.Connected,
                 2 => RdpConnectionState.Connecting,
                 _ => RdpConnectionState.Disconnected
@@ -149,6 +229,7 @@ internal sealed class RdpClientHost : AxHost
 
             string message = state switch
             {
+                RdpConnectionState.LoggedIn => $"Login concluído em {Server}.",
                 RdpConnectionState.Connected => $"Conectado a {Server}.",
                 RdpConnectionState.Connecting => $"Conectando a {Server}...",
                 _ when _connectionRequested => $"A conexão com {Server} foi encerrada.",
@@ -183,13 +264,118 @@ internal sealed class RdpClientHost : AxHost
 
     private void SetState(RdpConnectionState state, string message)
     {
-        if (ConnectionState == state && state != RdpConnectionState.Disconnected)
+        if (ConnectionState == state && string.Equals(_lastStateMessage, message, StringComparison.Ordinal))
         {
             return;
         }
 
         ConnectionState = state;
+        _lastStateMessage = message;
         ConnectionStateChanged?.Invoke(this, new RdpConnectionStateChangedEventArgs(state, message));
+    }
+
+    private void OnConnecting()
+    {
+        SetState(RdpConnectionState.Connecting, $"Conectando a {Server}...");
+    }
+
+    private void OnConnected()
+    {
+        SetState(RdpConnectionState.Connected, $"Conectado a {Server}; aguardando login.");
+        ScheduleSessionResize();
+    }
+
+    private void OnLoginComplete()
+    {
+        SetState(RdpConnectionState.LoggedIn, $"Login concluído em {Server}.");
+        ScheduleSessionResize();
+    }
+
+    private void OnDisconnected(int reason)
+    {
+        _connectionRequested = false;
+        _stateTimer.Stop();
+        _resizeTimer.Stop();
+        string suffix = reason == 0 ? string.Empty : $" (código {reason})";
+        SetState(RdpConnectionState.Disconnected, $"Sessão RDP desconectada{suffix}.");
+    }
+
+    private void OnFatalError(int errorCode)
+    {
+        _connectionRequested = false;
+        _stateTimer.Stop();
+        _resizeTimer.Stop();
+        SetState(RdpConnectionState.Disconnected, $"Erro fatal do controle RDP (código {errorCode}).");
+    }
+
+    private void OnLogonError(int errorCode)
+    {
+        SetState(RdpConnectionState.Connected, $"Falha de login em {Server} (código {errorCode}).");
+    }
+
+    private void ScheduleSessionResize()
+    {
+        _resizeTimer.Stop();
+        _resizeTimer.Start();
+    }
+
+    private void ApplySessionSize()
+    {
+        _resizeTimer.Stop();
+
+        if (_client is null
+            || ConnectionState is not (RdpConnectionState.Connected or RdpConnectionState.LoggedIn))
+        {
+            return;
+        }
+
+        Size sessionSize = GetSessionSize();
+        if (sessionSize == _lastSessionSize)
+        {
+            return;
+        }
+
+        uint physicalWidth = GetPhysicalDimension(sessionSize.Width);
+        uint physicalHeight = GetPhysicalDimension(sessionSize.Height);
+
+        try
+        {
+            InvokeMethod(
+                _client,
+                "UpdateSessionDisplaySettings",
+                (uint)sessionSize.Width,
+                (uint)sessionSize.Height,
+                physicalWidth,
+                physicalHeight,
+                0u,
+                100u,
+                100u);
+            _lastSessionSize = sessionSize;
+        }
+        catch (Exception exception) when (IsInteropFailure(exception))
+        {
+            // Servidores sem suporte mantêm o Smart Sizing configurado na conexão.
+        }
+    }
+
+    private Size GetSessionSize()
+    {
+        return new Size(
+            Math.Max(MinimumSessionDimension, ClientSize.Width),
+            Math.Max(MinimumSessionDimension, ClientSize.Height));
+    }
+
+    private uint GetPhysicalDimension(int pixels)
+    {
+        return (uint)Math.Max(1, Math.Round(pixels * 25.4 / DeviceDpi));
+    }
+
+    private static Size FitInside(Size source, Size bounds)
+    {
+        double scale = Math.Min((double)bounds.Width / source.Width, (double)bounds.Height / source.Height);
+        return new Size(
+            Math.Max(1, (int)Math.Round(source.Width * scale)),
+            Math.Max(1, (int)Math.Round(source.Height * scale)));
     }
 
     private static object? GetOptionalProperty(object target, string propertyName)
@@ -238,19 +424,64 @@ internal sealed class RdpClientHost : AxHost
             CultureInfo.InvariantCulture);
     }
 
-    private static void InvokeMethod(object target, string methodName)
+    private static void InvokeMethod(object target, string methodName, params object[] args)
     {
         target.GetType().InvokeMember(
             methodName,
             BindingFlags.InvokeMethod,
             binder: null,
             target,
-            args: null,
+            args.Length == 0 ? null : args,
             CultureInfo.InvariantCulture);
     }
 
     private static bool IsInteropFailure(Exception exception)
     {
         return exception is COMException or MissingMethodException or TargetInvocationException;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PrintWindow(IntPtr window, IntPtr targetDeviceContext, uint flags);
+
+    [ComImport]
+    [Guid("336D5562-EFA8-482E-8CB3-C5C0FC7A7DB6")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+    private interface IRdpClientEvents
+    {
+        [DispId(1)]
+        void OnConnecting();
+
+        [DispId(2)]
+        void OnConnected();
+
+        [DispId(3)]
+        void OnLoginComplete();
+
+        [DispId(4)]
+        void OnDisconnected(int reason);
+
+        [DispId(10)]
+        void OnFatalError(int errorCode);
+
+        [DispId(22)]
+        void OnLogonError(int errorCode);
+    }
+
+    [ComVisible(true)]
+    [ClassInterface(ClassInterfaceType.None)]
+    private sealed class RdpClientEventSink(RdpClientHost owner) : StandardOleMarshalObject, IRdpClientEvents
+    {
+        public void OnConnecting() => owner.OnConnecting();
+
+        public void OnConnected() => owner.OnConnected();
+
+        public void OnLoginComplete() => owner.OnLoginComplete();
+
+        public void OnDisconnected(int reason) => owner.OnDisconnected(reason);
+
+        public void OnFatalError(int errorCode) => owner.OnFatalError(errorCode);
+
+        public void OnLogonError(int errorCode) => owner.OnLogonError(errorCode);
     }
 }

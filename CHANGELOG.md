@@ -11,6 +11,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Open, create, edit, and save RDG files.
 - Group and server management.
 - Embedded RDP connection and disconnection through the Windows ActiveX control.
+- Connection and login state displayed per server in the tree.
+- Automatically refreshed thumbnail of the active remote session.
+- Remote desktop resolution automatically resized with the application window.
 - Automatic Windows light and dark theme integration.
 - Application icon and open-source repository documentation.
 
