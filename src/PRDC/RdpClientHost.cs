@@ -26,12 +26,20 @@ internal sealed class RdpClientHost : AxHost
     private const string MsRdpClient10NotSafeClassId = "A0C63C30-F08D-4AB4-907C-34905D770C7D";
     private const uint PrintWindowRenderFullContent = 0x00000002;
     private const int MinimumSessionDimension = 200;
+    private const int LeftWindowsScanCode = 0x5B;
+    private const int EnterScanCode = 0x1C;
+    private const uint InputKeyboard = 1;
+    private const uint KeyEventExtendedKey = 0x0001;
+    private const uint KeyEventKeyUp = 0x0002;
+    private const uint KeyEventScanCode = 0x0008;
     private readonly System.Windows.Forms.Timer _stateTimer = new() { Interval = 250 };
     private readonly System.Windows.Forms.Timer _resizeTimer = new() { Interval = 250 };
     private ConnectionPointCookie? _eventCookie;
     private RdpClientEventSink? _eventSink;
     private object? _client;
     private bool _connectionRequested;
+    private bool _disposed;
+    private bool _logOffPending;
     private string _lastStateMessage = string.Empty;
     private Size _lastSessionSize;
 
@@ -45,6 +53,8 @@ internal sealed class RdpClientHost : AxHost
     public event EventHandler<RdpConnectionStateChangedEventArgs>? ConnectionStateChanged;
 
     public RdpConnectionState ConnectionState { get; private set; }
+
+    public bool IsLogOffPending => _logOffPending;
 
     public string Server { get; private set; } = string.Empty;
 
@@ -104,6 +114,9 @@ internal sealed class RdpClientHost : AxHost
         SetOptionalProperty(client, "ConnectingText", $"Conectando a {Server}...");
         SetOptionalProperty(client, "ConnectedStatusText", $"Conectado a {Server}");
         SetOptionalProperty(client, "DisconnectedText", $"Desconectado de {Server}");
+        object securedSettings = GetProperty(client, "SecuredSettings2")
+            ?? throw new InvalidOperationException("O controle RDP não oferece as configurações de teclado necessárias.");
+        SetProperty(securedSettings, "KeyboardHookMode", 1);
         object? advancedSettings = GetOptionalProperty(client, "AdvancedSettings9");
         if (advancedSettings is not null)
         {
@@ -150,6 +163,132 @@ internal sealed class RdpClientHost : AxHost
         SetState(RdpConnectionState.Disconnected, "Sessão RDP desconectada.");
     }
 
+    public async Task LogOffSessionAsync()
+    {
+        if (ConnectionState != RdpConnectionState.LoggedIn || string.IsNullOrWhiteSpace(Server))
+        {
+            throw new InvalidOperationException("A sessão precisa estar autenticada para fazer logoff.");
+        }
+
+        if (_logOffPending)
+        {
+            throw new InvalidOperationException("Já existe uma solicitação de logoff em andamento.");
+        }
+
+        _logOffPending = true;
+
+        try
+        {
+            Select();
+            Focus();
+            await Task.Delay(100);
+
+            SendRemoteKeys(
+                [0, 0, -1, -1],
+                [
+                    CreateKeyData(LeftWindowsScanCode, extended: true),
+                    CreateKeyData(0x13, extended: false),
+                    CreateKeyData(0x13, extended: false),
+                    CreateKeyData(LeftWindowsScanCode, extended: true)
+                ]);
+
+            await Task.Delay(750);
+
+            SendRemoteKeys(
+                [0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1],
+                [
+                    CreateKeyData(0x26, extended: false),
+                    CreateKeyData(0x26, extended: false),
+                    CreateKeyData(0x18, extended: false),
+                    CreateKeyData(0x18, extended: false),
+                    CreateKeyData(0x22, extended: false),
+                    CreateKeyData(0x22, extended: false),
+                    CreateKeyData(0x18, extended: false),
+                    CreateKeyData(0x18, extended: false),
+                    CreateKeyData(0x21, extended: false),
+                    CreateKeyData(0x21, extended: false),
+                    CreateKeyData(0x21, extended: false),
+                    CreateKeyData(0x21, extended: false),
+                    CreateKeyData(EnterScanCode, extended: false),
+                    CreateKeyData(EnterScanCode, extended: false)
+                ]);
+
+            SetState(ConnectionState, $"Comando de logoff enviado para {Server}.");
+        }
+        finally
+        {
+            _logOffPending = false;
+        }
+    }
+
+    private void SendRemoteKeys(short[] keyUp, int[] keyData)
+    {
+        if (keyUp.Length != keyData.Length)
+        {
+            throw new ArgumentException("Os vetores de estado e dados das teclas devem ter o mesmo tamanho.");
+        }
+
+        Select();
+        Focus();
+        if (!ContainsFocus)
+        {
+            throw new InvalidOperationException("Não foi possível direcionar o teclado para a sessão RDP.");
+        }
+
+        NativeInput[] inputs = new NativeInput[keyData.Length];
+        for (int index = 0; index < keyData.Length; index++)
+        {
+            uint flags = KeyEventScanCode;
+            if ((keyData[index] & (1 << 24)) != 0)
+            {
+                flags |= KeyEventExtendedKey;
+            }
+
+            if (keyUp[index] != 0)
+            {
+                flags |= KeyEventKeyUp;
+            }
+
+            inputs[index] = new NativeInput
+            {
+                Type = InputKeyboard,
+                Data = new NativeInputUnion
+                {
+                    Keyboard = new NativeKeyboardInput
+                    {
+                        ScanCode = (ushort)((keyData[index] >> 16) & 0xFF),
+                        Flags = flags
+                    }
+                }
+            };
+        }
+
+        int inputSize = Marshal.SizeOf<NativeInput>();
+        if (Environment.Is64BitProcess && inputSize != 40)
+        {
+            throw new InvalidOperationException($"Estrutura INPUT inválida: {inputSize} bytes; esperado: 40 bytes.");
+        }
+
+        uint sent = SendInput((uint)inputs.Length, inputs, inputSize);
+        if (sent != inputs.Length)
+        {
+            int error = Marshal.GetLastWin32Error();
+            throw new InvalidOperationException(
+                $"O Windows enviou {sent} de {inputs.Length} eventos de teclado para a sessão RDP. Erro Win32: {error}.");
+        }
+    }
+
+    private static int CreateKeyData(int scanCode, bool extended)
+    {
+        uint keyData = 1u | ((uint)scanCode << 16);
+        if (extended)
+        {
+            keyData |= 1u << 24;
+        }
+
+        return unchecked((int)keyData);
+    }
+
     protected override void OnSizeChanged(EventArgs e)
     {
         base.OnSizeChanged(e);
@@ -163,20 +302,25 @@ internal sealed class RdpClientHost : AxHost
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_disposed)
         {
+            _disposed = true;
             _stateTimer.Stop();
             _resizeTimer.Stop();
 
-            try
+            if (ConnectionState != RdpConnectionState.Disconnected)
             {
-                DisconnectSession();
-            }
-            catch (Exception exception) when (IsInteropFailure(exception))
-            {
-                // O controle pode já ter encerrado sua conexão durante o descarte.
+                try
+                {
+                    DisconnectSession();
+                }
+                catch (Exception exception) when (IsInteropFailure(exception))
+                {
+                    // O controle pode já ter liberado o RCW durante o descarte.
+                }
             }
 
+            _client = null;
             _stateTimer.Dispose();
             _resizeTimer.Dispose();
         }
@@ -437,12 +581,59 @@ internal sealed class RdpClientHost : AxHost
 
     private static bool IsInteropFailure(Exception exception)
     {
-        return exception is COMException or MissingMethodException or TargetInvocationException;
+        return exception is COMException
+            or InvalidComObjectException
+            or MissingMethodException
+            or TargetInvocationException;
     }
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool PrintWindow(IntPtr window, IntPtr targetDeviceContext, uint flags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(
+        uint numberOfInputs,
+        [In] NativeInput[] inputs,
+        int sizeOfInput);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeInput
+    {
+        public uint Type;
+        public NativeInputUnion Data;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct NativeInputUnion
+    {
+        [FieldOffset(0)]
+        public NativeKeyboardInput Keyboard;
+
+        [FieldOffset(0)]
+        public NativeMouseInput Mouse;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeKeyboardInput
+    {
+        public ushort VirtualKey;
+        public ushort ScanCode;
+        public uint Flags;
+        public uint Time;
+        public nuint ExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeMouseInput
+    {
+        public int X;
+        public int Y;
+        public uint MouseData;
+        public uint Flags;
+        public uint Time;
+        public nuint ExtraInfo;
+    }
 
     [ComImport]
     [Guid("336D5562-EFA8-482E-8CB3-C5C0FC7A7DB6")]
@@ -466,6 +657,7 @@ internal sealed class RdpClientHost : AxHost
 
         [DispId(22)]
         void OnLogonError(int errorCode);
+
     }
 
     [ComVisible(true)]

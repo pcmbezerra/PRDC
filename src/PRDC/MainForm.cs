@@ -6,6 +6,9 @@ namespace PRDC;
 
 internal sealed class MainForm : Form
 {
+    private const int ConnectionPaneWidth = 320;
+    private const int AutoHideConnectionPaneWidth = 34;
+    private const int SessionTabCloseButtonSize = 16;
     private readonly TreeView _tree = new()
     {
         Dock = DockStyle.Fill,
@@ -47,22 +50,44 @@ internal sealed class MainForm : Form
     private readonly ToolStripMenuItem _editMenuItem = new("&Editar...");
     private readonly ToolStripMenuItem _removeMenuItem = new("&Remover");
     private readonly ToolStripMenuItem _connectMenuItem = new("&Conectar");
+    private readonly ToolStripMenuItem _reconnectMenuItem = new("&Reconectar");
     private readonly ToolStripMenuItem _disconnectMenuItem = new("&Desconectar");
+    private readonly ToolStripMenuItem _logOffMenuItem = new("Fazer &logoff");
+    private readonly ToolStripMenuItem _closeSessionTabMenuItem = new("&Fechar aba");
+    private readonly ToolStripMenuItem _showConnectionPaneMenuItem = new("&Mostrar");
+    private readonly ToolStripMenuItem _hideConnectionPaneMenuItem = new("&Ocultar");
+    private readonly ToolStripMenuItem _autoHideConnectionPaneMenuItem = new("Ocultar &automaticamente");
     private readonly ToolStripButton _connectButton = new("Conectar");
     private readonly ToolStripButton _disconnectButton = new("Desconectar");
     private readonly TabControl _workspaceTabs = new() { Dock = DockStyle.Fill };
-    private readonly TabPage _sessionPage = new("Sessão") { Padding = new Padding(3) };
+    private readonly TabPage _sessionPage = new("Sessões") { Padding = new Padding(3) };
     private readonly Panel _sessionPanel = new() { Dock = DockStyle.Fill };
+    private readonly TabControl _sessionTabs = new()
+    {
+        Dock = DockStyle.Fill,
+        DrawMode = TabDrawMode.OwnerDrawFixed,
+        Padding = new Point(16, 4)
+    };
     private readonly Label _sessionPlaceholder = new()
     {
         Dock = DockStyle.Fill,
         Text = "Selecione um servidor e use Sessão > Conectar.",
         TextAlign = ContentAlignment.MiddleCenter
     };
+    private readonly Button _autoHideConnectionPaneButton = new()
+    {
+        AccessibleName = "Mostrar lista de conexões",
+        Dock = DockStyle.Fill,
+        FlatStyle = FlatStyle.Flat,
+        Text = "›",
+        Visible = false
+    };
+    private readonly System.Windows.Forms.Timer _autoHideTimer = new() { Interval = 500 };
+    private readonly Dictionary<XElement, RdpSession> _sessions = [];
     private RdgDocument _document = RdgDocument.CreateNew();
-    private RdpClientHost? _rdpHost;
-    private XElement? _activeServerElement;
-    private Bitmap? _latestThumbnail;
+    private SplitContainer? _workspaceSplit;
+    private ConnectionPaneMode _connectionPaneMode = ConnectionPaneMode.Visible;
+    private int _expandedConnectionPaneWidth = ConnectionPaneWidth;
     private bool _populatingTree;
 
     public MainForm()
@@ -75,6 +100,7 @@ internal sealed class MainForm : Form
 
         MainMenuStrip = BuildMenu();
         Controls.Add(BuildWorkspace());
+        _workspaceSplit!.Panel2MinSize = 300;
         Controls.Add(BuildToolStrip());
         Controls.Add(MainMenuStrip);
         Controls.Add(new StatusStrip { Items = { _statusLabel } });
@@ -84,7 +110,17 @@ internal sealed class MainForm : Form
         _tree.AfterCollapse += (_, eventArgs) => UpdateExpanded(eventArgs.Node, false);
         _tree.NodeMouseDoubleClick += (_, _) => ActivateSelectedNode();
         _tree.ContextMenuStrip = BuildContextMenu();
-        _thumbnailTimer.Tick += (_, _) => UpdateThumbnail();
+        _thumbnailTimer.Tick += (_, _) => UpdateThumbnails();
+        _sessionTabs.SelectedIndexChanged += (_, _) =>
+        {
+            UpdateSelection();
+            UpdateCommands();
+        };
+        _sessionTabs.DrawItem += DrawSessionTab;
+        _sessionTabs.MouseDown += OnSessionTabMouseDown;
+        _autoHideConnectionPaneButton.MouseEnter += (_, _) => ExpandAutoHideConnectionPane();
+        _autoHideConnectionPaneButton.Click += (_, _) => ExpandAutoHideConnectionPane();
+        _autoHideTimer.Tick += (_, _) => UpdateAutoHideConnectionPane();
 
         FormClosing += OnFormClosing;
         FormClosed += OnFormClosed;
@@ -133,18 +169,43 @@ internal sealed class MainForm : Form
         ]);
         edit.DropDownOpening += (_, _) => UpdateCommands();
 
+        ToolStripMenuItem view = new("E&xibir");
+        ToolStripMenuItem connectionPane = new("Lista de &conexões");
+        _showConnectionPaneMenuItem.Click += (_, _) => SetConnectionPaneMode(ConnectionPaneMode.Visible);
+        _hideConnectionPaneMenuItem.Click += (_, _) => SetConnectionPaneMode(ConnectionPaneMode.Hidden);
+        _autoHideConnectionPaneMenuItem.Click += (_, _) => SetConnectionPaneMode(ConnectionPaneMode.AutoHide);
+        connectionPane.DropDownItems.AddRange([
+            _showConnectionPaneMenuItem,
+            _hideConnectionPaneMenuItem,
+            _autoHideConnectionPaneMenuItem
+        ]);
+        view.DropDownItems.Add(connectionPane);
+        UpdateConnectionPaneMenu();
+
         ToolStripMenuItem session = new("&Sessão");
         _connectMenuItem.Click += (_, _) => ConnectSelectedServer();
         _connectMenuItem.ShortcutKeys = Keys.Control | Keys.Enter;
+        _reconnectMenuItem.Click += (_, _) => ReconnectSession();
+        _reconnectMenuItem.ShortcutKeys = Keys.Control | Keys.Shift | Keys.R;
         _disconnectMenuItem.Click += (_, _) => DisconnectSession();
         _disconnectMenuItem.ShortcutKeys = Keys.Control | Keys.Shift | Keys.D;
-        session.DropDownItems.AddRange([_connectMenuItem, _disconnectMenuItem]);
+        _logOffMenuItem.Click += (_, _) => LogOffSession();
+        _closeSessionTabMenuItem.Click += (_, _) => CloseCurrentSessionTab();
+        _closeSessionTabMenuItem.ShortcutKeys = Keys.Control | Keys.W;
+        session.DropDownItems.AddRange([
+            _connectMenuItem,
+            _reconnectMenuItem,
+            _disconnectMenuItem,
+            _logOffMenuItem,
+            new ToolStripSeparator(),
+            _closeSessionTabMenuItem
+        ]);
         session.DropDownOpening += (_, _) => UpdateCommands();
 
         ToolStripMenuItem help = new("A&juda");
         help.DropDownItems.Add(new ToolStripMenuItem("&Sobre", null, (_, _) => ShowAbout()));
 
-        menu.Items.AddRange([file, edit, session, help]);
+        menu.Items.AddRange([file, edit, view, session, help]);
         return menu;
     }
 
@@ -169,14 +230,25 @@ internal sealed class MainForm : Form
 
     private Control BuildWorkspace()
     {
-        SplitContainer split = new()
+        _workspaceSplit = new SplitContainer
         {
             Dock = DockStyle.Fill,
-            SplitterDistance = 320,
+            SplitterDistance = ConnectionPaneWidth,
+            Panel1MinSize = AutoHideConnectionPaneWidth,
             FixedPanel = FixedPanel.Panel1
         };
-        split.Panel1.Padding = new Padding(6);
-        split.Panel1.Controls.Add(_tree);
+        _workspaceSplit.Panel1.Padding = new Padding(6);
+        _workspaceSplit.Panel1.Controls.Add(_tree);
+        _workspaceSplit.Panel1.Controls.Add(_autoHideConnectionPaneButton);
+        _workspaceSplit.SplitterMoved += (_, _) =>
+        {
+            if (_connectionPaneMode != ConnectionPaneMode.Hidden
+                && _tree.Visible
+                && _workspaceSplit.SplitterDistance > AutoHideConnectionPaneWidth)
+            {
+                _expandedConnectionPaneWidth = _workspaceSplit.SplitterDistance;
+            }
+        };
 
         Panel details = new() { Dock = DockStyle.Fill, Padding = new Padding(28) };
         FlowLayoutPanel detailLayout = new()
@@ -201,8 +273,8 @@ internal sealed class MainForm : Form
         _sessionPage.Controls.Add(_sessionPanel);
         _workspaceTabs.TabPages.Add(detailsPage);
         _workspaceTabs.TabPages.Add(_sessionPage);
-        split.Panel2.Controls.Add(_workspaceTabs);
-        return split;
+        _workspaceSplit.Panel2.Controls.Add(_workspaceTabs);
+        return _workspaceSplit;
     }
 
     private ContextMenuStrip BuildContextMenu()
@@ -231,7 +303,7 @@ internal sealed class MainForm : Form
 
     private void NewDocument()
     {
-        if (!ConfirmDisconnectSession() || !ConfirmDiscardChanges())
+        if (!ConfirmCloseSessions() || !ConfirmDiscardChanges())
         {
             return;
         }
@@ -244,7 +316,7 @@ internal sealed class MainForm : Form
 
     private void OpenDocument()
     {
-        if (!ConfirmDisconnectSession() || !ConfirmDiscardChanges())
+        if (!ConfirmCloseSessions() || !ConfirmDiscardChanges())
         {
             return;
         }
@@ -362,6 +434,11 @@ internal sealed class MainForm : Form
         if (node.Kind == RdgNodeKind.Server)
         {
             _document.UpdateServer(node, dialog.NodeName, dialog.HostName);
+            if (_sessions.TryGetValue(node.Element, out RdpSession? session))
+            {
+                session.DisplayName = dialog.NodeName;
+                UpdateSessionTitle(session);
+            }
         }
         else
         {
@@ -395,22 +472,24 @@ internal sealed class MainForm : Form
         try
         {
             _workspaceTabs.SelectedTab = _sessionPage;
+            RdpSession session = GetOrCreateSession(server);
+            _sessionTabs.SelectedTab = session.Page;
+            UpdateConnectionViews();
 
-            if (_rdpHost is null)
+            if (IsSessionActive(session))
             {
-                _rdpHost = new RdpClientHost();
-                _rdpHost.ConnectionStateChanged += OnRdpConnectionStateChanged;
-                _sessionPanel.Controls.Clear();
-                _sessionPanel.Controls.Add(_rdpHost);
+                SetStatus($"A sessão de {server.Name} já está ativa.");
+                return;
             }
 
-            _sessionPage.Text = $"Sessão - {server.Name}";
-            _activeServerElement = server.Element;
-            UpdateConnectionViews();
-            _rdpHost.ConnectTo(server.HostName);
+            session.Host.ConnectTo(server.HostName);
             UpdateCommands();
         }
-        catch (Exception exception) when (exception is InvalidOperationException or System.Runtime.InteropServices.COMException or TargetInvocationException)
+        catch (Exception exception) when (
+            exception is InvalidOperationException
+                or System.Runtime.InteropServices.COMException
+                or System.Runtime.InteropServices.InvalidComObjectException
+                or TargetInvocationException)
         {
             MessageBox.Show(
                 this,
@@ -425,16 +504,20 @@ internal sealed class MainForm : Form
 
     private void DisconnectSession()
     {
-        if (_rdpHost is null)
+        RdpSession? session = GetCommandSession();
+        if (session is null || !IsSessionActive(session))
         {
             return;
         }
 
         try
         {
-            _rdpHost.DisconnectSession();
+            session.Host.DisconnectSession();
         }
-        catch (Exception exception) when (exception is System.Runtime.InteropServices.COMException or TargetInvocationException)
+        catch (Exception exception) when (
+            exception is System.Runtime.InteropServices.COMException
+                or System.Runtime.InteropServices.InvalidComObjectException
+                or TargetInvocationException)
         {
             MessageBox.Show(
                 this,
@@ -449,23 +532,233 @@ internal sealed class MainForm : Form
         }
     }
 
+    private void ReconnectSession()
+    {
+        RdpSession? session = GetCommandSession();
+        if (session is null || !IsSessionActive(session) || string.IsNullOrWhiteSpace(session.Host.Server))
+        {
+            return;
+        }
+
+        string server = session.Host.Server;
+        RdpClientHost previousHost = session.Host;
+        previousHost.ConnectionStateChanged -= OnRdpConnectionStateChanged;
+
+        try
+        {
+            session.ReplaceHost();
+            session.Host.ConnectionStateChanged += OnRdpConnectionStateChanged;
+            session.Host.ConnectTo(server);
+            SetStatus($"Reconectando a {session.DisplayName}...");
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException
+                or System.Runtime.InteropServices.COMException
+                or System.Runtime.InteropServices.InvalidComObjectException
+                or TargetInvocationException)
+        {
+            session.Host.ConnectionStateChanged -= OnRdpConnectionStateChanged;
+            MessageBox.Show(
+                this,
+                exception.InnerException?.Message ?? exception.Message,
+                "Erro ao reconectar",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            SetStatus("Falha ao reconectar a sessão RDP.");
+        }
+        finally
+        {
+            UpdateSessionTitles();
+            UpdateConnectionViews();
+            UpdateCommands();
+        }
+    }
+
+    private async void LogOffSession()
+    {
+        RdpSession? session = GetCommandSession();
+        if (session?.Host.ConnectionState != RdpConnectionState.LoggedIn)
+        {
+            return;
+        }
+
+        DialogResult result = MessageBox.Show(
+            this,
+            $"Fazer logoff da sessão Windows em {session.DisplayName}? Aplicativos abertos no servidor serão encerrados.",
+            "Confirmar logoff",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+        if (result != DialogResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            SetStatus($"Solicitando logoff em {session.DisplayName}...");
+            Task operation = session.Host.LogOffSessionAsync();
+            UpdateCommands();
+            await operation;
+            SetStatus($"Logoff solicitado em {session.DisplayName}.");
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException
+                or System.Runtime.InteropServices.COMException
+                or InvalidCastException)
+        {
+            string message = exception is System.Runtime.InteropServices.COMException
+                ? $"{exception.Message}{Environment.NewLine}{Environment.NewLine}HRESULT: 0x{exception.HResult:X8}"
+                : exception.Message;
+            MessageBox.Show(
+                this,
+                message,
+                "Erro ao fazer logoff",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            SetStatus("Falha ao fazer logoff da sessão remota.");
+        }
+        finally
+        {
+            UpdateCommands();
+        }
+    }
+
+    private void CloseCurrentSessionTab()
+    {
+        RdpSession? session = _sessionTabs.SelectedTab?.Tag as RdpSession;
+        if (session is null)
+        {
+            return;
+        }
+
+        if (IsSessionActive(session))
+        {
+            DialogResult result = MessageBox.Show(
+                this,
+                $"A sessão de {session.DisplayName} será desconectada e a aba será fechada. Continuar?",
+                "Fechar aba",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+            if (result != DialogResult.Yes)
+            {
+                return;
+            }
+        }
+
+        CloseSession(session);
+        UpdateConnectionViews();
+        UpdateCommands();
+    }
+
+    private void DrawSessionTab(object? sender, DrawItemEventArgs eventArgs)
+    {
+        if (eventArgs.Index < 0 || eventArgs.Index >= _sessionTabs.TabPages.Count)
+        {
+            return;
+        }
+
+        TabPage page = _sessionTabs.TabPages[eventArgs.Index];
+        bool selected = (eventArgs.State & DrawItemState.Selected) == DrawItemState.Selected;
+        Color background = selected ? SystemColors.Window : SystemColors.Control;
+        using (SolidBrush backgroundBrush = new(background))
+        {
+            eventArgs.Graphics.FillRectangle(backgroundBrush, eventArgs.Bounds);
+        }
+
+        Rectangle closeButton = GetSessionTabCloseButtonBounds(eventArgs.Bounds);
+        Rectangle textBounds = Rectangle.FromLTRB(
+            eventArgs.Bounds.Left + 6,
+            eventArgs.Bounds.Top,
+            closeButton.Left - 3,
+            eventArgs.Bounds.Bottom);
+        TextRenderer.DrawText(
+            eventArgs.Graphics,
+            page.Text,
+            Font,
+            textBounds,
+            SystemColors.ControlText,
+            TextFormatFlags.Left
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.SingleLine
+                | TextFormatFlags.EndEllipsis);
+
+        const int glyphInset = 4;
+        using Pen closePen = new(SystemColors.ControlText, 1.5F);
+        eventArgs.Graphics.DrawLine(
+            closePen,
+            closeButton.Left + glyphInset,
+            closeButton.Top + glyphInset,
+            closeButton.Right - glyphInset - 1,
+            closeButton.Bottom - glyphInset - 1);
+        eventArgs.Graphics.DrawLine(
+            closePen,
+            closeButton.Right - glyphInset - 1,
+            closeButton.Top + glyphInset,
+            closeButton.Left + glyphInset,
+            closeButton.Bottom - glyphInset - 1);
+
+        if (selected)
+        {
+            ControlPaint.DrawFocusRectangle(eventArgs.Graphics, eventArgs.Bounds);
+        }
+    }
+
+    private void OnSessionTabMouseDown(object? sender, MouseEventArgs eventArgs)
+    {
+        if (eventArgs.Button != MouseButtons.Left)
+        {
+            return;
+        }
+
+        for (int index = 0; index < _sessionTabs.TabPages.Count; index++)
+        {
+            Rectangle tabBounds = _sessionTabs.GetTabRect(index);
+            if (!GetSessionTabCloseButtonBounds(tabBounds).Contains(eventArgs.Location))
+            {
+                continue;
+            }
+
+            _sessionTabs.SelectedIndex = index;
+            CloseCurrentSessionTab();
+            return;
+        }
+    }
+
+    private static Rectangle GetSessionTabCloseButtonBounds(Rectangle tabBounds)
+    {
+        return new Rectangle(
+            tabBounds.Right - SessionTabCloseButtonSize - 4,
+            tabBounds.Top + ((tabBounds.Height - SessionTabCloseButtonSize) / 2),
+            SessionTabCloseButtonSize,
+            SessionTabCloseButtonSize);
+    }
+
     private void OnRdpConnectionStateChanged(object? sender, RdpConnectionStateChangedEventArgs eventArgs)
     {
+        RdpSession? session = _sessions.Values.FirstOrDefault(
+            candidate => ReferenceEquals(candidate.Host, sender));
+        if (session is null)
+        {
+            return;
+        }
+
         SetStatus(eventArgs.Message);
         if (eventArgs.State == RdpConnectionState.Disconnected)
         {
-            _thumbnailTimer.Stop();
-            ClearThumbnail();
-            _activeServerElement = null;
-            _sessionPage.Text = "Sessão";
+            session.ClearThumbnail();
         }
         else if (eventArgs.State is RdpConnectionState.Connected or RdpConnectionState.LoggedIn)
         {
-            SelectActiveServer();
-            UpdateThumbnail();
+            UpdateThumbnail(session);
             _thumbnailTimer.Start();
         }
 
+        if (!_sessions.Values.Any(IsSessionConnected))
+        {
+            _thumbnailTimer.Stop();
+        }
+
+        UpdateSessionTitles();
         UpdateConnectionViews();
         UpdateCommands();
     }
@@ -490,6 +783,7 @@ internal sealed class MainForm : Form
             return;
         }
 
+        CloseSessionsFor(node.Element);
         _document.Remove(node);
         PopulateTree();
         MarkChanged("Item removido.");
@@ -597,29 +891,26 @@ internal sealed class MainForm : Form
         _nodeHost.Text = node?.Kind == RdgNodeKind.Server ? $"Host: {node.HostName}" : string.Empty;
         bool isServer = node?.Kind == RdgNodeKind.Server;
         RdpConnectionState state = isServer ? GetConnectionState(node!) : RdpConnectionState.Disconnected;
+        RdpSession? session = isServer ? GetSession(node!) : null;
         _connectionState.Visible = isServer;
         _connectionState.Text = isServer ? $"Estado: {GetConnectionStateText(state)}" : string.Empty;
-        bool hasActiveSession = _activeServerElement is not null
-            && _rdpHost?.ConnectionState is
-                RdpConnectionState.Connecting or RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
-        bool showThumbnail = isServer || hasActiveSession;
-        _thumbnailTitle.Visible = showThumbnail;
-        _thumbnail.Visible = showThumbnail;
-        _thumbnailStatus.Visible = showThumbnail;
-        _thumbnailTitle.Text = hasActiveSession
-            ? $"Miniatura da sessão ativa - {_rdpHost!.Server}"
+        _thumbnailTitle.Visible = isServer;
+        _thumbnail.Visible = isServer;
+        _thumbnailStatus.Visible = isServer;
+        _thumbnailTitle.Text = session is not null
+            ? $"Miniatura da sessão - {session.Host.Server}"
             : "Miniatura da sessão";
-        _thumbnail.Image = hasActiveSession ? _latestThumbnail : null;
-        _thumbnailStatus.Text = hasActiveSession
-            ? _rdpHost!.ConnectionState switch
+        _thumbnail.Image = session?.Thumbnail;
+        _thumbnailStatus.Text = isServer
+            ? state switch
             {
                 RdpConnectionState.Connecting => "Aguardando a conexão para gerar a miniatura.",
-                RdpConnectionState.Connected or RdpConnectionState.LoggedIn when _latestThumbnail is null =>
+                RdpConnectionState.Connected or RdpConnectionState.LoggedIn when session?.Thumbnail is null =>
                     "Capturando a sessão remota...",
                 RdpConnectionState.Connected or RdpConnectionState.LoggedIn => "Atualizada automaticamente a cada segundo.",
                 _ => "Sem sessão ativa."
             }
-            : isServer ? "Sem sessão ativa para este servidor." : string.Empty;
+            : string.Empty;
         UpdateCommands();
     }
 
@@ -631,10 +922,15 @@ internal sealed class MainForm : Form
         _addServerMenuItem.Enabled = container;
         _editMenuItem.Enabled = selected is not null;
         _removeMenuItem.Enabled = selected is { Kind: not RdgNodeKind.File };
-        bool sessionActive = _rdpHost?.ConnectionState is
-            RdpConnectionState.Connecting or RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
-        _connectMenuItem.Enabled = selected?.Kind == RdgNodeKind.Server && !sessionActive;
-        _disconnectMenuItem.Enabled = sessionActive;
+        RdpSession? selectedSession = selected?.Kind == RdgNodeKind.Server ? GetSession(selected) : null;
+        _connectMenuItem.Enabled = selected?.Kind == RdgNodeKind.Server
+            && (selectedSession is null || !IsSessionActive(selectedSession));
+        RdpSession? commandSession = GetCommandSession();
+        _reconnectMenuItem.Enabled = commandSession is not null && IsSessionActive(commandSession);
+        _disconnectMenuItem.Enabled = commandSession is not null && IsSessionActive(commandSession);
+        _logOffMenuItem.Enabled = commandSession?.Host.ConnectionState == RdpConnectionState.LoggedIn
+            && !commandSession.Host.IsLogOffPending;
+        _closeSessionTabMenuItem.Enabled = _sessionTabs.SelectedTab?.Tag is RdpSession;
         _connectButton.Enabled = _connectMenuItem.Enabled;
         _disconnectButton.Enabled = _disconnectMenuItem.Enabled;
         _saveMenuItem.Enabled = true;
@@ -672,17 +968,17 @@ internal sealed class MainForm : Form
         };
     }
 
-    private bool ConfirmDisconnectSession()
+    private bool ConfirmCloseSessions()
     {
-        if (_rdpHost?.ConnectionState is not (
-            RdpConnectionState.Connecting or RdpConnectionState.Connected or RdpConnectionState.LoggedIn))
+        if (!_sessions.Values.Any(IsSessionActive))
         {
+            CloseAllSessions();
             return true;
         }
 
         DialogResult result = MessageBox.Show(
             this,
-            "A sessão RDP atual será desconectada. Continuar?",
+            "Todas as sessões RDP serão desconectadas. Continuar?",
             "PRDC",
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Question);
@@ -692,7 +988,7 @@ internal sealed class MainForm : Form
             return false;
         }
 
-        DisconnectSession();
+        CloseAllSessions();
         return true;
     }
 
@@ -704,36 +1000,20 @@ internal sealed class MainForm : Form
             return;
         }
 
-        DisconnectSession();
+        DisconnectAllSessions();
     }
 
     private void OnFormClosed(object? sender, FormClosedEventArgs eventArgs)
     {
         _thumbnailTimer.Dispose();
-        ClearThumbnail();
+        _autoHideTimer.Dispose();
+        CloseAllSessions();
     }
 
     private void UpdateConnectionViews()
     {
         UpdateTreeConnectionStates(_tree.Nodes);
         UpdateSelection();
-    }
-
-    private void SelectActiveServer()
-    {
-        if (_activeServerElement is null)
-        {
-            return;
-        }
-
-        TreeNode? activeServer = FindTreeNode(_tree.Nodes, _activeServerElement);
-        if (activeServer is null || ReferenceEquals(_tree.SelectedNode, activeServer))
-        {
-            return;
-        }
-
-        _tree.SelectedNode = activeServer;
-        activeServer.EnsureVisible();
     }
 
     private void UpdateTreeConnectionStates(TreeNodeCollection nodes)
@@ -758,14 +1038,12 @@ internal sealed class MainForm : Form
 
     private RdpConnectionState GetConnectionState(RdgNode server)
     {
-        return IsActiveServer(server)
-            ? _rdpHost?.ConnectionState ?? RdpConnectionState.Disconnected
-            : RdpConnectionState.Disconnected;
+        return GetSession(server)?.Host.ConnectionState ?? RdpConnectionState.Disconnected;
     }
 
-    private bool IsActiveServer(RdgNode server)
+    private RdpSession? GetSession(RdgNode server)
     {
-        return _activeServerElement is not null && ReferenceEquals(server.Element, _activeServerElement);
+        return _sessions.GetValueOrDefault(server.Element);
     }
 
     private static string GetConnectionStateText(RdpConnectionState state)
@@ -779,32 +1057,284 @@ internal sealed class MainForm : Form
         };
     }
 
-    private void UpdateThumbnail()
+    private RdpSession GetOrCreateSession(RdgNode server)
     {
-        if (_rdpHost?.ConnectionState is not (RdpConnectionState.Connected or RdpConnectionState.LoggedIn))
+        if (_sessions.TryGetValue(server.Element, out RdpSession? existing))
         {
-            return;
+            existing.DisplayName = server.Name;
+            UpdateSessionTitle(existing);
+            return existing;
         }
 
-        Bitmap? thumbnail = _rdpHost.CaptureThumbnail(_thumbnail.ClientSize);
+        RdpSession session = new(server.Element, server.Name);
+        session.Host.ConnectionStateChanged += OnRdpConnectionStateChanged;
+        session.Page.Tag = session;
+        _sessions.Add(server.Element, session);
+        _sessionTabs.TabPages.Add(session.Page);
+
+        if (!_sessionPanel.Controls.Contains(_sessionTabs))
+        {
+            _sessionPanel.Controls.Clear();
+            _sessionPanel.Controls.Add(_sessionTabs);
+        }
+
+        UpdateSessionTitles();
+        return session;
+    }
+
+    private RdpSession? GetCommandSession()
+    {
+        if (_sessionTabs.SelectedTab?.Tag is RdpSession currentSession)
+        {
+            return currentSession;
+        }
+
+        if (SelectedNode is { Kind: RdgNodeKind.Server } selected
+            && GetSession(selected) is { } selectedSession
+            && IsSessionActive(selectedSession))
+        {
+            return selectedSession;
+        }
+
+        return _sessionTabs.SelectedTab?.Tag as RdpSession;
+    }
+
+    private static bool IsSessionActive(RdpSession session)
+    {
+        return session.Host.ConnectionState is
+            RdpConnectionState.Connecting or RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
+    }
+
+    private static bool IsSessionConnected(RdpSession session)
+    {
+        return session.Host.ConnectionState is RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
+    }
+
+    private void UpdateThumbnails()
+    {
+        foreach (RdpSession session in _sessions.Values.Where(IsSessionConnected).ToArray())
+        {
+            UpdateThumbnail(session);
+        }
+
+        UpdateSelection();
+    }
+
+    private void UpdateThumbnail(RdpSession session)
+    {
+        Bitmap? thumbnail = session.Host.CaptureThumbnail(_thumbnail.ClientSize);
         if (thumbnail is null)
         {
             return;
         }
 
-        Bitmap? previous = _latestThumbnail;
-        _latestThumbnail = thumbnail;
-        _thumbnail.Image = thumbnail;
-        _thumbnailStatus.Text = "Atualizada automaticamente a cada segundo.";
+        Bitmap? previous = session.Thumbnail;
+        session.Thumbnail = thumbnail;
+        if (SelectedNode is { Kind: RdgNodeKind.Server } selected
+            && ReferenceEquals(selected.Element, session.ServerElement))
+        {
+            _thumbnail.Image = thumbnail;
+            _thumbnailStatus.Text = "Atualizada automaticamente a cada segundo.";
+        }
 
         previous?.Dispose();
     }
 
-    private void ClearThumbnail()
+    private void UpdateSessionTitles()
     {
+        foreach (RdpSession session in _sessions.Values)
+        {
+            UpdateSessionTitle(session);
+        }
+
+        int activeCount = _sessions.Values.Count(IsSessionActive);
+        _sessionPage.Text = activeCount == 0 ? "Sessões" : $"Sessões ({activeCount})";
+    }
+
+    private void UpdateSessionTitle(RdpSession session)
+    {
+        session.Page.Text = $"{session.DisplayName} [{GetConnectionStateText(session.Host.ConnectionState)}]";
+        _sessionTabs.Invalidate();
+    }
+
+    private void DisconnectAllSessions()
+    {
+        foreach (RdpSession session in _sessions.Values.Where(IsSessionActive).ToArray())
+        {
+            try
+            {
+                session.Host.DisconnectSession();
+            }
+            catch (Exception exception) when (
+                exception is System.Runtime.InteropServices.COMException
+                    or System.Runtime.InteropServices.InvalidComObjectException
+                    or TargetInvocationException)
+            {
+                SetStatus($"Falha ao desconectar {session.DisplayName}: {exception.InnerException?.Message ?? exception.Message}");
+            }
+        }
+    }
+
+    private void CloseSessionsFor(XElement element)
+    {
+        RdpSession[] sessions = _sessions.Values
+            .Where(session => ReferenceEquals(session.ServerElement, element)
+                || session.ServerElement.Ancestors().Any(ancestor => ReferenceEquals(ancestor, element)))
+            .ToArray();
+
+        foreach (RdpSession session in sessions)
+        {
+            CloseSession(session);
+        }
+    }
+
+    private void CloseAllSessions()
+    {
+        foreach (RdpSession session in _sessions.Values.ToArray())
+        {
+            CloseSession(session);
+        }
+
+        _thumbnailTimer.Stop();
         _thumbnail.Image = null;
-        _latestThumbnail?.Dispose();
-        _latestThumbnail = null;
+        _sessionPanel.Controls.Clear();
+        _sessionPanel.Controls.Add(_sessionPlaceholder);
+        UpdateSessionTitles();
+    }
+
+    private void CloseSession(RdpSession session)
+    {
+        try
+        {
+            if (IsSessionActive(session))
+            {
+                session.Host.DisconnectSession();
+            }
+        }
+        catch (Exception exception) when (
+            exception is System.Runtime.InteropServices.COMException
+                or System.Runtime.InteropServices.InvalidComObjectException
+                or TargetInvocationException)
+        {
+            SetStatus($"Falha ao encerrar {session.DisplayName}: {exception.InnerException?.Message ?? exception.Message}");
+        }
+
+        session.Host.ConnectionStateChanged -= OnRdpConnectionStateChanged;
+        _sessions.Remove(session.ServerElement);
+        _sessionTabs.TabPages.Remove(session.Page);
+        if (ReferenceEquals(_thumbnail.Image, session.Thumbnail))
+        {
+            _thumbnail.Image = null;
+        }
+
+        session.Dispose();
+        if (_sessions.Count == 0)
+        {
+            _thumbnailTimer.Stop();
+            _sessionPanel.Controls.Clear();
+            _sessionPanel.Controls.Add(_sessionPlaceholder);
+        }
+
+        UpdateSessionTitles();
+    }
+
+    private void SetConnectionPaneMode(ConnectionPaneMode mode)
+    {
+        _connectionPaneMode = mode;
+        _autoHideTimer.Stop();
+
+        if (_workspaceSplit is null)
+        {
+            return;
+        }
+
+        _workspaceSplit.Panel1Collapsed = mode == ConnectionPaneMode.Hidden;
+        if (mode == ConnectionPaneMode.Hidden)
+        {
+            UpdateConnectionPaneMenu();
+            return;
+        }
+
+        if (mode == ConnectionPaneMode.AutoHide)
+        {
+            CollapseAutoHideConnectionPane();
+        }
+        else
+        {
+            _tree.Visible = true;
+            _autoHideConnectionPaneButton.Visible = false;
+            _workspaceSplit.SplitterDistance = GetExpandedConnectionPaneWidth();
+        }
+
+        UpdateConnectionPaneMenu();
+    }
+
+    private void ExpandAutoHideConnectionPane()
+    {
+        if (_connectionPaneMode != ConnectionPaneMode.AutoHide || _workspaceSplit is null)
+        {
+            return;
+        }
+
+        _autoHideConnectionPaneButton.Visible = false;
+        _tree.Visible = true;
+        _workspaceSplit.SplitterDistance = GetExpandedConnectionPaneWidth();
+        _autoHideTimer.Start();
+    }
+
+    private void CollapseAutoHideConnectionPane()
+    {
+        if (_workspaceSplit is null)
+        {
+            return;
+        }
+
+        if (_tree.Visible && _workspaceSplit.SplitterDistance > AutoHideConnectionPaneWidth)
+        {
+            _expandedConnectionPaneWidth = _workspaceSplit.SplitterDistance;
+        }
+
+        _tree.Visible = false;
+        _autoHideConnectionPaneButton.Visible = true;
+        _workspaceSplit.SplitterDistance = AutoHideConnectionPaneWidth;
+        _autoHideTimer.Stop();
+    }
+
+    private void UpdateAutoHideConnectionPane()
+    {
+        if (_connectionPaneMode != ConnectionPaneMode.AutoHide
+            || _workspaceSplit is null
+            || !_tree.Visible
+            || _tree.ContextMenuStrip?.Visible == true)
+        {
+            return;
+        }
+
+        Rectangle paneBounds = _workspaceSplit.Panel1.RectangleToScreen(_workspaceSplit.Panel1.ClientRectangle);
+        if (!paneBounds.Contains(Cursor.Position))
+        {
+            CollapseAutoHideConnectionPane();
+        }
+    }
+
+    private int GetExpandedConnectionPaneWidth()
+    {
+        if (_workspaceSplit is null)
+        {
+            return _expandedConnectionPaneWidth;
+        }
+
+        int maximum = Math.Max(
+            AutoHideConnectionPaneWidth,
+            _workspaceSplit.ClientSize.Width - _workspaceSplit.Panel2MinSize - _workspaceSplit.SplitterWidth);
+        return Math.Clamp(_expandedConnectionPaneWidth, AutoHideConnectionPaneWidth, maximum);
+    }
+
+    private void UpdateConnectionPaneMenu()
+    {
+        _showConnectionPaneMenuItem.Checked = _connectionPaneMode == ConnectionPaneMode.Visible;
+        _hideConnectionPaneMenuItem.Checked = _connectionPaneMode == ConnectionPaneMode.Hidden;
+        _autoHideConnectionPaneMenuItem.Checked = _connectionPaneMode == ConnectionPaneMode.AutoHide;
     }
 
     private void MarkChanged(string status)
@@ -828,5 +1358,56 @@ internal sealed class MainForm : Form
     {
         using AboutDialog dialog = new(Icon);
         dialog.ShowDialog(this);
+    }
+}
+
+internal enum ConnectionPaneMode
+{
+    Visible,
+    Hidden,
+    AutoHide
+}
+
+internal sealed class RdpSession : IDisposable
+{
+    public RdpSession(XElement serverElement, string displayName)
+    {
+        ServerElement = serverElement;
+        DisplayName = displayName;
+        Host = new RdpClientHost();
+        Page = new TabPage(displayName) { Padding = new Padding(3) };
+        Page.Controls.Add(Host);
+    }
+
+    public XElement ServerElement { get; }
+
+    public string DisplayName { get; set; }
+
+    public RdpClientHost Host { get; private set; }
+
+    public TabPage Page { get; }
+
+    public Bitmap? Thumbnail { get; set; }
+
+    public void ClearThumbnail()
+    {
+        Thumbnail?.Dispose();
+        Thumbnail = null;
+    }
+
+    public void ReplaceHost()
+    {
+        RdpClientHost previous = Host;
+        Page.Controls.Remove(previous);
+        Host = new RdpClientHost();
+        Page.Controls.Add(Host);
+        previous.Dispose();
+        ClearThumbnail();
+    }
+
+    public void Dispose()
+    {
+        ClearThumbnail();
+        Page.Dispose();
     }
 }
