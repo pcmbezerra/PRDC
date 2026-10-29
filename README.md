@@ -108,7 +108,7 @@ Focused issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTIN
 
 ## Origins and independence
 
-PRDC was initially informed by static behavioral analysis of Remote Desktop Connection Manager using [REA](https://github.com/morluto/rea). REA is a development-time analysis tool and is not a runtime dependency. PRDC contains an independent implementation and does not distribute RDCMan or `mstscax.dll`. See [DISCLAIMER.md](DISCLAIMER.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+PRDC was initially informed by static behavioral analysis of Remote Desktop Connection Manager. The PRDC contains an independent implementation and does not distribute RDCMan or `mstscax.dll`. See [DISCLAIMER.md](DISCLAIMER.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 
