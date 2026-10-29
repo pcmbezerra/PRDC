@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-29
+
+### Added
+
+- Color-coded status indicator circles in the server tree and session tabs (red when disconnected, yellow while authenticating, green when authenticated and active, blue when authenticated in a background tab).
+- Automatic width adjustment of the connection list pane based on visible tree nodes.
+- Dynamic session tab width expansion to display full server names, truncating with an ellipsis only when space is constrained across many open tabs.
+
+### Fixed
+
+- Eliminated continuous session tab flickering caused by redundant `PollState` notifications, background `PrintWindow` thumbnail captures while the sessions view is active, and unnecessary `TabPage`/`TreeNode` text reassignments.
+
+## [1.0.0] - 2026-10-19
+
 ### Added
 
 - Open, create, edit, and save RDG files.
@@ -24,4 +38,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - ActiveX cleanup no longer raises a JIT exception when its COM wrapper was already released.
 
-[Unreleased]: https://github.com/pcmbezerra/PRDC/commits/main
+[Unreleased]: https://github.com/pcmbezerra/PRDC/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/pcmbezerra/PRDC/compare/3540546...v1.0.2
+[1.0.0]: https://github.com/pcmbezerra/PRDC/commits/3540546

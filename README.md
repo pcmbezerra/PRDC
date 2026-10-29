@@ -29,7 +29,8 @@ PRDC organizes Remote Desktop endpoints in RDCMan-compatible `.rdg` files and op
 - Organize servers into nested groups.
 - Connect to multiple RDP hosts simultaneously in independent session tabs.
 - Reconnect, disconnect, log off without blocking the UI, or close an individual session tab with its `×` button.
-- Show disconnected, connecting, connected, and logged-in states in the server tree.
+- Show color-coded status indicators (red when disconnected, yellow while authenticating, green for the active authenticated session, and blue for background authenticated sessions) in both the server tree and session tabs.
+- Automatically resize the connection list width to fit visible tree items and expand session tabs to show the full server name when space permits.
 - Keep a live thumbnail of each remote session in the details view.
 - Show, hide, or automatically hide the RDG connection list.
 - Resize the remote desktop resolution automatically with the application window.

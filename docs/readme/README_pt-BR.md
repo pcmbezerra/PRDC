@@ -29,7 +29,8 @@ O PRDC organiza endpoints de Área de Trabalho Remota em arquivos `.rdg` compat�
 - Organizar servidores em grupos aninhados.
 - Conectar simultaneamente a vários hosts RDP em abas de sessão independentes.
 - Reconectar, desconectar, fazer logoff sem bloquear a interface ou fechar uma aba de sessão pelo botão `×`.
-- Exibir na árvore os estados desconectado, conectando, conectado e login concluído.
+- Exibir indicadores visuais por cor (vermelho quando desconectado, amarelo durante autenticação, verde para a sessão autenticada ativa e azul para sessões autenticadas em segundo plano) tanto na árvore de servidores quanto nas abas de sessão.
+- Ajustar automaticamente a largura da lista de conexões aos itens visíveis na árvore e expandir as abas de sessão para exibir o nome completo do servidor enquanto houver espaço disponível.
 - Manter uma miniatura atualizada de cada sessão remota na tela de detalhes.
 - Mostrar, ocultar ou ocultar automaticamente a lista de conexões do RDG.
 - Redimensionar automaticamente a resolução remota junto com a janela do aplicativo.
@@ -77,7 +78,7 @@ Não publique arquivos `.rdg` contendo hostnames internos, usuários, credenciai
 
 ## Origem e independência
 
-O desenvolvimento inicial foi orientado por análise comportamental estática do Remote Desktop Connection Manager com o [REA](https://github.com/morluto/rea). O REA é uma ferramenta de desenvolvimento e não é dependência de execução. O PRDC possui implementação independente e não distribui o RDCMan nem `mstscax.dll`.
+O desenvolvimento inicial foi orientado por análise comportamental estática do Remote Desktop Connection Manager. O PRDC possui implementação independente e não distribui o RDCMan nem `mstscax.dll`.
 
 ## Licença
 

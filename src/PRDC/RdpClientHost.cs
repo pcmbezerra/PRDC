@@ -371,6 +371,11 @@ internal sealed class RdpClientHost : AxHost
                 _ => RdpConnectionState.Disconnected
             };
 
+            if (state == ConnectionState)
+            {
+                return;
+            }
+
             string message = state switch
             {
                 RdpConnectionState.LoggedIn => $"Login concluído em {Server}.",

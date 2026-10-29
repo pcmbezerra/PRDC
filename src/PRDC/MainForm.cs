@@ -1,3 +1,4 @@
+using System.Drawing.Drawing2D;
 using System.Reflection;
 using System.Xml;
 using System.Xml.Linq;
@@ -6,12 +7,23 @@ namespace PRDC;
 
 internal sealed class MainForm : Form
 {
-    private const int ConnectionPaneWidth = 320;
+    private const int ConnectionPaneWidth = 220;
+    private const int MinimumExpandedConnectionPaneWidth = 180;
     private const int AutoHideConnectionPaneWidth = 34;
     private const int SessionTabCloseButtonSize = 16;
+    private const int MinimumSessionTabWidth = 76;
+    private const int DefaultSessionTabWidth = 110;
+    private const int SessionTabHorizontalChrome = 58;
+    private const int StatusCircleDiameter = 10;
+    private const int StatusCircleSpacing = 6;
+    private static readonly Color DisconnectedStatusColor = Color.FromArgb(220, 53, 69);
+    private static readonly Color AuthenticatingStatusColor = Color.FromArgb(245, 180, 0);
+    private static readonly Color ConnectedStatusColor = Color.FromArgb(40, 167, 69);
+    private static readonly Color InactiveConnectedStatusColor = Color.FromArgb(0, 120, 212);
     private readonly TreeView _tree = new()
     {
         Dock = DockStyle.Fill,
+        DrawMode = TreeViewDrawMode.OwnerDrawText,
         HideSelection = false,
         LabelEdit = false
     };
@@ -60,13 +72,15 @@ internal sealed class MainForm : Form
     private readonly ToolStripButton _connectButton = new("Conectar");
     private readonly ToolStripButton _disconnectButton = new("Desconectar");
     private readonly TabControl _workspaceTabs = new() { Dock = DockStyle.Fill };
+    private readonly TabPage _detailsPage = new("Detalhes") { Padding = new Padding(3) };
     private readonly TabPage _sessionPage = new("Sessões") { Padding = new Padding(3) };
     private readonly Panel _sessionPanel = new() { Dock = DockStyle.Fill };
     private readonly TabControl _sessionTabs = new()
     {
         Dock = DockStyle.Fill,
         DrawMode = TabDrawMode.OwnerDrawFixed,
-        Padding = new Point(16, 4)
+        SizeMode = TabSizeMode.Fixed,
+        ItemSize = new Size(DefaultSessionTabWidth, 26)
     };
     private readonly Label _sessionPlaceholder = new()
     {
@@ -105,23 +119,36 @@ internal sealed class MainForm : Form
         Controls.Add(MainMenuStrip);
         Controls.Add(new StatusStrip { Items = { _statusLabel } });
 
+        _tree.DrawNode += DrawTreeNode;
         _tree.AfterSelect += (_, _) => UpdateSelection();
         _tree.AfterExpand += (_, eventArgs) => UpdateExpanded(eventArgs.Node, true);
         _tree.AfterCollapse += (_, eventArgs) => UpdateExpanded(eventArgs.Node, false);
         _tree.NodeMouseDoubleClick += (_, _) => ActivateSelectedNode();
         _tree.ContextMenuStrip = BuildContextMenu();
         _thumbnailTimer.Tick += (_, _) => UpdateThumbnails();
+        _workspaceTabs.SelectedIndexChanged += (_, _) =>
+        {
+            _tree.Invalidate();
+            InvalidateSessionTabHeaders();
+            UpdateThumbnails();
+            UpdateSelection();
+        };
         _sessionTabs.SelectedIndexChanged += (_, _) =>
         {
+            _tree.Invalidate();
+            InvalidateSessionTabHeaders();
             UpdateSelection();
             UpdateCommands();
         };
         _sessionTabs.DrawItem += DrawSessionTab;
         _sessionTabs.MouseDown += OnSessionTabMouseDown;
+        _sessionTabs.SizeChanged += (_, _) => UpdateSessionTabSizes();
         _autoHideConnectionPaneButton.MouseEnter += (_, _) => ExpandAutoHideConnectionPane();
         _autoHideConnectionPaneButton.Click += (_, _) => ExpandAutoHideConnectionPane();
         _autoHideTimer.Tick += (_, _) => UpdateAutoHideConnectionPane();
 
+        Shown += (_, _) => AutoResizeConnectionPane();
+        SizeChanged += (_, _) => ClampConnectionPaneWidth();
         FormClosing += OnFormClosing;
         FormClosed += OnFormClosed;
         PopulateTree();
@@ -267,11 +294,10 @@ internal sealed class MainForm : Form
         detailLayout.Controls.Add(_thumbnailStatus);
         details.Controls.Add(detailLayout);
 
-        TabPage detailsPage = new("Detalhes") { Padding = new Padding(3) };
-        detailsPage.Controls.Add(details);
+        _detailsPage.Controls.Add(details);
         _sessionPanel.Controls.Add(_sessionPlaceholder);
         _sessionPage.Controls.Add(_sessionPanel);
-        _workspaceTabs.TabPages.Add(detailsPage);
+        _workspaceTabs.TabPages.Add(_detailsPage);
         _workspaceTabs.TabPages.Add(_sessionPage);
         _workspaceSplit.Panel2.Controls.Add(_workspaceTabs);
         return _workspaceSplit;
@@ -650,6 +676,73 @@ internal sealed class MainForm : Form
         UpdateCommands();
     }
 
+    private void DrawTreeNode(object? sender, DrawTreeNodeEventArgs eventArgs)
+    {
+        if (eventArgs.Node is null || eventArgs.Bounds.Width <= 0 || eventArgs.Bounds.Height <= 0)
+        {
+            return;
+        }
+
+        RdgNode? node = eventArgs.Node.Tag as RdgNode;
+        if (node is null)
+        {
+            eventArgs.DrawDefault = true;
+            return;
+        }
+
+        bool selected = (eventArgs.State & TreeNodeStates.Selected) == TreeNodeStates.Selected;
+        Color backColor = selected ? SystemColors.Highlight : _tree.BackColor;
+        Color foreColor = selected ? SystemColors.HighlightText : _tree.ForeColor;
+
+        int textOffset = node.Kind == RdgNodeKind.Server
+            ? 3 + StatusCircleDiameter + StatusCircleSpacing
+            : 2;
+        int measuredTextWidth = TextRenderer.MeasureText(
+            eventArgs.Graphics,
+            node.Name,
+            _tree.Font,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix).Width;
+        int boundsWidth = Math.Max(eventArgs.Bounds.Width, textOffset + measuredTextWidth + 4);
+        Rectangle nodeBounds = new(eventArgs.Bounds.Left, eventArgs.Bounds.Top, boundsWidth, eventArgs.Bounds.Height);
+
+        using (SolidBrush backgroundBrush = new(backColor))
+        {
+            eventArgs.Graphics.FillRectangle(backgroundBrush, nodeBounds);
+        }
+
+        if (node.Kind == RdgNodeKind.Server)
+        {
+            Rectangle circleBounds = new(
+                nodeBounds.Left + 3,
+                nodeBounds.Top + ((nodeBounds.Height - StatusCircleDiameter) / 2),
+                StatusCircleDiameter,
+                StatusCircleDiameter);
+            DrawStatusCircle(eventArgs.Graphics, circleBounds, GetServerStatusColor(node.Element));
+        }
+
+        Rectangle textBounds = Rectangle.FromLTRB(
+            nodeBounds.Left + textOffset,
+            nodeBounds.Top,
+            nodeBounds.Right,
+            nodeBounds.Bottom);
+        TextRenderer.DrawText(
+            eventArgs.Graphics,
+            node.Name,
+            _tree.Font,
+            textBounds,
+            foreColor,
+            TextFormatFlags.Left
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.SingleLine
+                | TextFormatFlags.NoPrefix);
+
+        if ((eventArgs.State & TreeNodeStates.Focused) == TreeNodeStates.Focused)
+        {
+            ControlPaint.DrawFocusRectangle(eventArgs.Graphics, nodeBounds, foreColor, backColor);
+        }
+    }
+
     private void DrawSessionTab(object? sender, DrawItemEventArgs eventArgs)
     {
         if (eventArgs.Index < 0 || eventArgs.Index >= _sessionTabs.TabPages.Count)
@@ -665,11 +758,21 @@ internal sealed class MainForm : Form
             eventArgs.Graphics.FillRectangle(backgroundBrush, eventArgs.Bounds);
         }
 
+        Rectangle circleBounds = new(
+            eventArgs.Bounds.Left + 7,
+            eventArgs.Bounds.Top + ((eventArgs.Bounds.Height - StatusCircleDiameter) / 2),
+            StatusCircleDiameter,
+            StatusCircleDiameter);
+        Color statusColor = page.Tag is RdpSession session
+            ? GetServerStatusColor(session.ServerElement)
+            : DisconnectedStatusColor;
+        DrawStatusCircle(eventArgs.Graphics, circleBounds, statusColor);
+
         Rectangle closeButton = GetSessionTabCloseButtonBounds(eventArgs.Bounds);
         Rectangle textBounds = Rectangle.FromLTRB(
-            eventArgs.Bounds.Left + 6,
+            circleBounds.Right + StatusCircleSpacing,
             eventArgs.Bounds.Top,
-            closeButton.Left - 3,
+            closeButton.Left - 4,
             eventArgs.Bounds.Bottom);
         TextRenderer.DrawText(
             eventArgs.Graphics,
@@ -680,7 +783,8 @@ internal sealed class MainForm : Form
             TextFormatFlags.Left
                 | TextFormatFlags.VerticalCenter
                 | TextFormatFlags.SingleLine
-                | TextFormatFlags.EndEllipsis);
+                | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.NoPrefix);
 
         const int glyphInset = 4;
         using Pen closePen = new(SystemColors.ControlText, 1.5F);
@@ -700,6 +804,21 @@ internal sealed class MainForm : Form
         if (selected)
         {
             ControlPaint.DrawFocusRectangle(eventArgs.Graphics, eventArgs.Bounds);
+        }
+    }
+
+    private static void DrawStatusCircle(Graphics graphics, Rectangle bounds, Color color)
+    {
+        SmoothingMode previousMode = graphics.SmoothingMode;
+        try
+        {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using SolidBrush brush = new(color);
+            graphics.FillEllipse(brush, bounds);
+        }
+        finally
+        {
+            graphics.SmoothingMode = previousMode;
         }
     }
 
@@ -815,6 +934,8 @@ internal sealed class MainForm : Form
         {
             UpdateSelection();
         }
+
+        AutoResizeConnectionPane();
     }
 
     private TreeNode CreateTreeNode(RdgNode node)
@@ -943,6 +1064,7 @@ internal sealed class MainForm : Form
         {
             _document.SetExpanded(node, expanded);
             UpdateTitle();
+            AutoResizeConnectionPane();
         }
     }
 
@@ -1012,28 +1134,39 @@ internal sealed class MainForm : Form
 
     private void UpdateConnectionViews()
     {
-        UpdateTreeConnectionStates(_tree.Nodes);
+        _tree.Invalidate();
+        InvalidateSessionTabHeaders();
         UpdateSelection();
     }
 
-    private void UpdateTreeConnectionStates(TreeNodeCollection nodes)
-    {
-        foreach (TreeNode treeNode in nodes)
-        {
-            if (treeNode.Tag is RdgNode node)
-            {
-                treeNode.Text = GetTreeNodeText(node);
-            }
-
-            UpdateTreeConnectionStates(treeNode.Nodes);
-        }
-    }
-
-    private string GetTreeNodeText(RdgNode node)
+    private static string GetTreeNodeText(RdgNode node)
     {
         return node.Kind == RdgNodeKind.Server
-            ? $"{node.Name} [{GetConnectionStateText(GetConnectionState(node))}]"
+            ? $"    {node.Name}"
             : node.Name;
+    }
+
+    private Color GetServerStatusColor(XElement serverElement)
+    {
+        if (!_sessions.TryGetValue(serverElement, out RdpSession? session))
+        {
+            return DisconnectedStatusColor;
+        }
+
+        return session.Host.ConnectionState switch
+        {
+            RdpConnectionState.Connecting or RdpConnectionState.Connected => AuthenticatingStatusColor,
+            RdpConnectionState.LoggedIn => IsSessionWindowOpen(session)
+                ? ConnectedStatusColor
+                : InactiveConnectedStatusColor,
+            _ => DisconnectedStatusColor
+        };
+    }
+
+    private bool IsSessionWindowOpen(RdpSession session)
+    {
+        return ReferenceEquals(_workspaceTabs.SelectedTab, _sessionPage)
+            && ReferenceEquals(_sessionTabs.SelectedTab, session.Page);
     }
 
     private RdpConnectionState GetConnectionState(RdgNode server)
@@ -1112,12 +1245,15 @@ internal sealed class MainForm : Form
 
     private void UpdateThumbnails()
     {
-        foreach (RdpSession session in _sessions.Values.Where(IsSessionConnected).ToArray())
+        if (!ReferenceEquals(_workspaceTabs.SelectedTab, _detailsPage)
+            || SelectedNode is not { Kind: RdgNodeKind.Server } selected
+            || GetSession(selected) is not { } session
+            || !IsSessionConnected(session))
         {
-            UpdateThumbnail(session);
+            return;
         }
 
-        UpdateSelection();
+        UpdateThumbnail(session);
     }
 
     private void UpdateThumbnail(RdpSession session)
@@ -1144,17 +1280,86 @@ internal sealed class MainForm : Form
     {
         foreach (RdpSession session in _sessions.Values)
         {
-            UpdateSessionTitle(session);
+            if (!string.Equals(session.Page.Text, session.DisplayName, StringComparison.Ordinal))
+            {
+                session.Page.Text = session.DisplayName;
+            }
         }
 
         int activeCount = _sessions.Values.Count(IsSessionActive);
-        _sessionPage.Text = activeCount == 0 ? "Sessões" : $"Sessões ({activeCount})";
+        string sessionPageTitle = activeCount == 0 ? "Sessões" : $"Sessões ({activeCount})";
+        if (!string.Equals(_sessionPage.Text, sessionPageTitle, StringComparison.Ordinal))
+        {
+            _sessionPage.Text = sessionPageTitle;
+        }
+
+        UpdateSessionTabSizes();
+        InvalidateSessionTabHeaders();
     }
 
     private void UpdateSessionTitle(RdpSession session)
     {
-        session.Page.Text = $"{session.DisplayName} [{GetConnectionStateText(session.Host.ConnectionState)}]";
-        _sessionTabs.Invalidate();
+        if (!string.Equals(session.Page.Text, session.DisplayName, StringComparison.Ordinal))
+        {
+            session.Page.Text = session.DisplayName;
+        }
+
+        UpdateSessionTabSizes();
+        InvalidateSessionTabHeaders();
+    }
+
+    private void UpdateSessionTabSizes()
+    {
+        int tabCount = _sessionTabs.TabPages.Count;
+        if (tabCount == 0)
+        {
+            return;
+        }
+
+        int maxTextWidth = 0;
+        using (Graphics graphics = _sessionTabs.CreateGraphics())
+        {
+            foreach (TabPage page in _sessionTabs.TabPages)
+            {
+                int textWidth = TextRenderer.MeasureText(
+                    graphics,
+                    page.Text,
+                    Font,
+                    Size.Empty,
+                    TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix).Width;
+                if (textWidth > maxTextWidth)
+                {
+                    maxTextWidth = textWidth;
+                }
+            }
+        }
+
+        int fullTabWidth = Math.Max(DefaultSessionTabWidth, maxTextWidth + SessionTabHorizontalChrome);
+        int availableWidth = _sessionTabs.ClientSize.Width > 12
+            ? _sessionTabs.ClientSize.Width - 8
+            : _sessionPanel.ClientSize.Width - 8;
+        int targetWidth = availableWidth > 0 && (fullTabWidth * tabCount) > availableWidth
+            ? Math.Max(MinimumSessionTabWidth, availableWidth / tabCount)
+            : fullTabWidth;
+        int targetHeight = Math.Max(26, Font.Height + 10);
+        Size targetSize = new(targetWidth, targetHeight);
+        if (_sessionTabs.ItemSize != targetSize)
+        {
+            _sessionTabs.ItemSize = targetSize;
+        }
+    }
+
+    private void InvalidateSessionTabHeaders()
+    {
+        if (!_sessionTabs.IsHandleCreated || _sessionTabs.TabPages.Count == 0)
+        {
+            return;
+        }
+
+        for (int index = 0; index < _sessionTabs.TabPages.Count; index++)
+        {
+            _sessionTabs.Invalidate(_sessionTabs.GetTabRect(index));
+        }
     }
 
     private void DisconnectAllSessions()
@@ -1314,6 +1519,91 @@ internal sealed class MainForm : Form
         if (!paneBounds.Contains(Cursor.Position))
         {
             CollapseAutoHideConnectionPane();
+        }
+    }
+
+    private void AutoResizeConnectionPane()
+    {
+        if (_workspaceSplit is null || _populatingTree)
+        {
+            return;
+        }
+
+        _expandedConnectionPaneWidth = CalculateOptimalConnectionPaneWidth();
+        ClampConnectionPaneWidth();
+    }
+
+    private void ClampConnectionPaneWidth()
+    {
+        if (_workspaceSplit is null
+            || _populatingTree
+            || _connectionPaneMode == ConnectionPaneMode.Hidden
+            || !_tree.Visible)
+        {
+            return;
+        }
+
+        int targetWidth = GetExpandedConnectionPaneWidth();
+        if (_workspaceSplit.SplitterDistance != targetWidth)
+        {
+            _workspaceSplit.SplitterDistance = targetWidth;
+        }
+    }
+
+    private int CalculateOptimalConnectionPaneWidth()
+    {
+        if (_tree.Nodes.Count == 0)
+        {
+            return MinimumExpandedConnectionPaneWidth;
+        }
+
+        int maxNodeRight = 0;
+        using Graphics graphics = _tree.CreateGraphics();
+        foreach (TreeNode node in GetVisibleTreeNodes(_tree.Nodes))
+        {
+            RdgNode? rdgNode = node.Tag as RdgNode;
+            string displayText = rdgNode?.Name ?? node.Text;
+            int textWidth = TextRenderer.MeasureText(
+                graphics,
+                displayText,
+                _tree.Font,
+                Size.Empty,
+                TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix).Width;
+            int statusWidth = rdgNode?.Kind == RdgNodeKind.Server
+                ? 3 + StatusCircleDiameter + StatusCircleSpacing
+                : 2;
+
+            int nodeLeft = node.Bounds.Left > 0
+                ? node.Bounds.Left
+                : ((node.Level + 1) * _tree.Indent) + 20;
+            int nodeRight = Math.Max(node.Bounds.Right, nodeLeft + statusWidth + textWidth + 8);
+            if (nodeRight > maxNodeRight)
+            {
+                maxNodeRight = nodeRight;
+            }
+        }
+
+        int chromeWidth = _workspaceSplit is not null
+            ? _workspaceSplit.Panel1.Padding.Horizontal
+                + (SystemInformation.BorderSize.Width * 4)
+                + SystemInformation.VerticalScrollBarWidth
+                + 12
+            : 40;
+        return Math.Max(MinimumExpandedConnectionPaneWidth, maxNodeRight + chromeWidth);
+    }
+
+    private static IEnumerable<TreeNode> GetVisibleTreeNodes(TreeNodeCollection nodes)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            yield return node;
+            if (node.IsExpanded)
+            {
+                foreach (TreeNode child in GetVisibleTreeNodes(node.Nodes))
+                {
+                    yield return child;
+                }
+            }
         }
     }
 

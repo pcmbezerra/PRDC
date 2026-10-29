@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <PlatformTarget>x64</PlatformTarget>
     <ApplicationIcon>PRDC.ico</ApplicationIcon>
-    <Version>0.1.0</Version>
+    <Version>1.0.2</Version>
     <Authors>Paulo Bezerra</Authors>
     <Product>PRDC</Product>
     <Description>Open-source Remote Desktop connection manager for Windows.</Description>
