@@ -1,5 +1,7 @@
 using System.Drawing.Drawing2D;
+using System.Net.Http;
 using System.Reflection;
+using System.Text.Json;
 using System.Xml;
 using System.Xml.Linq;
 
@@ -57,6 +59,8 @@ internal sealed class MainForm : Form
     private readonly ToolStripStatusLabel _statusLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
     private readonly ToolStripMenuItem _saveMenuItem = new("&Salvar");
     private readonly ToolStripMenuItem _saveAsMenuItem = new("Salvar &como...");
+    private readonly ToolStripMenuItem _refreshGuacamoleMenuItem = new("&Atualizar lista do Guacamole");
+    private readonly ToolStripMenuItem _removeGuacamoleMenuItem = new("&Remover inventário do Guacamole...");
     private readonly ToolStripMenuItem _addGroupMenuItem = new("Adicionar &grupo...");
     private readonly ToolStripMenuItem _addServerMenuItem = new("Adicionar &servidor...");
     private readonly ToolStripMenuItem _editMenuItem = new("&Editar...");
@@ -97,12 +101,16 @@ internal sealed class MainForm : Form
         Visible = false
     };
     private readonly System.Windows.Forms.Timer _autoHideTimer = new() { Interval = 500 };
-    private readonly Dictionary<XElement, RdpSession> _sessions = [];
+    private readonly Dictionary<XElement, RdpSession> _sessions = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<XElement, GuacamoleConnectionReference> _guacamoleReferences = new(ReferenceEqualityComparer.Instance);
     private RdgDocument _document = RdgDocument.CreateNew();
     private SplitContainer? _workspaceSplit;
     private ConnectionPaneMode _connectionPaneMode = ConnectionPaneMode.Visible;
     private int _expandedConnectionPaneWidth = ConnectionPaneWidth;
     private bool _populatingTree;
+    private bool _isGuacamoleInventory;
+    private bool _isGuacamoleInventoryModified;
+    private bool _startupInventoryLoadAttempted;
 
     public MainForm()
     {
@@ -147,7 +155,7 @@ internal sealed class MainForm : Form
         _autoHideConnectionPaneButton.Click += (_, _) => ExpandAutoHideConnectionPane();
         _autoHideTimer.Tick += (_, _) => UpdateAutoHideConnectionPane();
 
-        Shown += (_, _) => AutoResizeConnectionPane();
+        Shown += OnShown;
         SizeChanged += (_, _) => ClampConnectionPaneWidth();
         FormClosing += OnFormClosing;
         FormClosed += OnFormClosed;
@@ -172,14 +180,32 @@ internal sealed class MainForm : Form
         _saveMenuItem.Click += (_, _) => SaveDocument();
         _saveMenuItem.ShortcutKeys = Keys.Control | Keys.S;
         _saveAsMenuItem.Click += (_, _) => SaveDocumentAs();
+
+        ToolStripMenuItem loginGuacamoleItem = new("&Login no Guacamole...", null, (_, _) => LoginGuacamoleAsync())
+        {
+            ShortcutKeys = Keys.Control | Keys.Shift | Keys.G
+        };
+        _refreshGuacamoleMenuItem.Click += (_, _) => RefreshGuacamoleAsync();
+        _refreshGuacamoleMenuItem.ShortcutKeys = Keys.Control | Keys.Shift | Keys.U;
+        _removeGuacamoleMenuItem.Click += (_, _) => RemoveGuacamoleInventory();
+
         ToolStripMenuItem exitItem = new("Sai&r", null, (_, _) => Close())
         {
             ShortcutKeys = Keys.Alt | Keys.F4
         };
         file.DropDownItems.AddRange([
-            newItem, openItem, new ToolStripSeparator(), _saveMenuItem, _saveAsMenuItem,
-            new ToolStripSeparator(), exitItem
+            newItem,
+            openItem,
+            _saveMenuItem,
+            _saveAsMenuItem,
+            new ToolStripSeparator(),
+            loginGuacamoleItem,
+            _refreshGuacamoleMenuItem,
+            _removeGuacamoleMenuItem,
+            new ToolStripSeparator(),
+            exitItem
         ]);
+        file.DropDownOpening += (_, _) => UpdateCommands();
 
         ToolStripMenuItem edit = new("&Editar");
         _addGroupMenuItem.Click += (_, _) => AddGroup();
@@ -335,8 +361,12 @@ internal sealed class MainForm : Form
         }
 
         _document = RdgDocument.CreateNew();
+        _guacamoleReferences.Clear();
+        _isGuacamoleInventory = false;
+        _isGuacamoleInventoryModified = false;
         PopulateTree();
         UpdateTitle();
+        UpdateCommands();
         SetStatus("Novo arquivo RDG criado.");
     }
 
@@ -360,14 +390,349 @@ internal sealed class MainForm : Form
         try
         {
             _document = RdgDocument.Load(dialog.FileName);
+            _guacamoleReferences.Clear();
+            _isGuacamoleInventory = false;
+            _isGuacamoleInventoryModified = false;
             PopulateTree();
             UpdateTitle();
+            UpdateCommands();
             SetStatus($"Aberto: {dialog.FileName}");
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or XmlException or InvalidDataException)
         {
             MessageBox.Show(this, exception.Message, "Erro ao abrir RDG", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    private async void OnShown(object? sender, EventArgs e)
+    {
+        AutoResizeConnectionPane();
+        await LoadCachedGuacamoleInventoryAsync();
+    }
+
+    private async Task LoadCachedGuacamoleInventoryAsync()
+    {
+        if (_startupInventoryLoadAttempted)
+        {
+            return;
+        }
+
+        _startupInventoryLoadAttempted = true;
+
+        if (!GuacamoleInventoryCache.Exists())
+        {
+            SetStatus("Pronto.");
+            return;
+        }
+
+        GuacamoleCacheLoadResult loadResult;
+        try
+        {
+            loadResult = await GuacamoleInventoryCache.LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao carregar o inventário do Guacamole: {ex.Message}");
+            return;
+        }
+
+        if (loadResult.IsSuccess && loadResult.CacheRoot is not null)
+        {
+            try
+            {
+                GuacamoleImportResult materialized = GuacamoleInventoryCache.Materialize(loadResult.CacheRoot);
+                _document = materialized.Document;
+                _guacamoleReferences.Clear();
+                foreach ((XElement element, GuacamoleConnectionReference reference) in materialized.ConnectionReferences)
+                {
+                    _guacamoleReferences[element] = reference;
+                }
+
+                _isGuacamoleInventory = true;
+                _isGuacamoleInventoryModified = false;
+                PopulateTree();
+                UpdateTitle();
+                UpdateCommands();
+
+                string lastUpdate = loadResult.CacheRoot.SavedAtUtc.ToLocalTime().ToString("dd/MM/yyyy HH:mm");
+                SetStatus($"Inventário Guacamole carregado: {materialized.ServerCount} servidor(es) em {materialized.GroupCount} grupo(s). Última atualização: {lastUpdate}.");
+            }
+            catch (Exception ex)
+            {
+                SetStatus($"Erro ao materializar o inventário do Guacamole: {ex.Message}");
+            }
+
+            return;
+        }
+
+        switch (loadResult.FailureKind)
+        {
+            case GuacamoleCacheFailureKind.NotFound:
+                SetStatus("Pronto.");
+                break;
+
+            case GuacamoleCacheFailureKind.Corrupt:
+                SetStatus("O inventário local do Guacamole não pôde ser carregado e foi preservado para diagnóstico. Efetue login novamente para recriá-lo.");
+                break;
+
+            case GuacamoleCacheFailureKind.UnsupportedSchema:
+                SetStatus("O inventário local do Guacamole foi criado por uma versão incompatível do PRDC e não pôde ser carregado.");
+                break;
+
+            case GuacamoleCacheFailureKind.AccessDenied:
+                SetStatus("O PRDC não possui permissão para acessar o inventário local do Guacamole.");
+                break;
+
+            case GuacamoleCacheFailureKind.IoFailure:
+            case GuacamoleCacheFailureKind.ValidationFailed:
+            default:
+                SetStatus("Não foi possível salvar ou carregar o inventário local do Guacamole.");
+                break;
+        }
+    }
+
+    private async void LoginGuacamoleAsync()
+    {
+        using GuacamoleLoginDialog dialog = new();
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            SetStatus("Login no Guacamole cancelado.");
+            return;
+        }
+
+        await ExecuteGuacamoleImportFlowAsync(dialog.ServerUrl, dialog.UserName, dialog.Password, isRefresh: false);
+    }
+
+    private async void RefreshGuacamoleAsync()
+    {
+        string? initialUrl = GetActiveGuacamoleBaseUrl();
+        if (initialUrl is null && GuacamoleInventoryCache.Exists())
+        {
+            try
+            {
+                var cached = await GuacamoleInventoryCache.LoadAsync();
+                if (cached.IsSuccess && cached.CacheRoot is not null)
+                {
+                    initialUrl = cached.CacheRoot.BaseUrl;
+                }
+            }
+            catch
+            {
+                // Fallback silencioso
+            }
+        }
+
+        using GuacamoleLoginDialog dialog = new(initialUrl ?? string.Empty);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            SetStatus("Atualização do Guacamole cancelada.");
+            return;
+        }
+
+        await ExecuteGuacamoleImportFlowAsync(dialog.ServerUrl, dialog.UserName, dialog.Password, isRefresh: true);
+    }
+
+    private async Task ExecuteGuacamoleImportFlowAsync(
+        string serverUrl,
+        string username,
+        string password,
+        bool isRefresh)
+    {
+        string operationName = isRefresh ? "Atualização do Guacamole" : "Login no Guacamole";
+        GuacamoleImportResult result;
+        UseWaitCursor = true;
+        SetStatus(isRefresh
+            ? "Atualizando inventário do Guacamole..."
+            : "Autenticando no Guacamole e carregando o inventário...");
+
+        try
+        {
+            result = await GuacamoleInventoryProvider.ImportAsync(serverUrl, username, password);
+        }
+        catch (TaskCanceledException)
+        {
+            MessageBox.Show(
+                this,
+                "Tempo limite esgotado ao comunicar com o servidor Guacamole.",
+                $"Erro na {operationName.ToLowerInvariant()}",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            SetStatus($"Falha ao autenticar ou carregar o inventário do Guacamole.");
+            return;
+        }
+        catch (HttpRequestException exception)
+        {
+            MessageBox.Show(
+                this,
+                $"Não foi possível conectar ao servidor Guacamole: {exception.Message}",
+                $"Erro na {operationName.ToLowerInvariant()}",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            SetStatus($"Falha ao autenticar ou carregar o inventário do Guacamole.");
+            return;
+        }
+        catch (JsonException)
+        {
+            MessageBox.Show(
+                this,
+                "O servidor Guacamole retornou uma resposta em formato JSON inválido.",
+                $"Erro na {operationName.ToLowerInvariant()}",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            SetStatus($"Falha ao autenticar ou carregar o inventário do Guacamole.");
+            return;
+        }
+        catch (InvalidOperationException exception)
+        {
+            MessageBox.Show(
+                this,
+                exception.Message,
+                $"Erro na {operationName.ToLowerInvariant()}",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            SetStatus($"Falha ao autenticar ou carregar o inventário do Guacamole.");
+            return;
+        }
+        finally
+        {
+            UseWaitCursor = false;
+        }
+
+        GuacamoleCacheRoot cacheRoot;
+        try
+        {
+            cacheRoot = GuacamoleInventoryCache.FromImportResult(result);
+            GuacamoleInventoryCache.ValidatePayload(cacheRoot);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                $"Os dados recebidos do Guacamole não puderam ser validados: {ex.Message}",
+                $"Erro na {operationName.ToLowerInvariant()}",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            SetStatus("Falha na validação do inventário do Guacamole.");
+            return;
+        }
+
+        if (!ConfirmCloseSessions() || !ConfirmDiscardChanges())
+        {
+            SetStatus($"{operationName} cancelado.");
+            return;
+        }
+
+        GuacamoleCacheSaveResult saveResult = await GuacamoleInventoryCache.SaveAsync(cacheRoot);
+        if (!saveResult.IsSuccess)
+        {
+            string errorMessage = saveResult.FailureKind switch
+            {
+                GuacamoleCacheFailureKind.AccessDenied =>
+                    "O PRDC não possui permissão para acessar o inventário local do Guacamole.",
+                GuacamoleCacheFailureKind.ValidationFailed =>
+                    "Os dados recebidos do Guacamole não puderam ser validados.",
+                GuacamoleCacheFailureKind.IoFailure or _ =>
+                    "Não foi possível salvar ou carregar o inventário local do Guacamole."
+            };
+
+            MessageBox.Show(
+                this,
+                errorMessage,
+                "Erro ao salvar cache do Guacamole",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            SetStatus("Falha ao salvar o inventário local do Guacamole.");
+            return;
+        }
+
+        _document = result.Document;
+        _guacamoleReferences.Clear();
+        foreach ((XElement element, GuacamoleConnectionReference reference) in result.ConnectionReferences)
+        {
+            _guacamoleReferences[element] = reference;
+        }
+
+        _isGuacamoleInventory = true;
+        _isGuacamoleInventoryModified = false;
+
+        PopulateTree();
+        UpdateTitle();
+        UpdateCommands();
+
+        if (isRefresh)
+        {
+            SetStatus($"Lista do Guacamole atualizada: {result.ServerCount} servidor(es) RDP em {result.GroupCount} grupo(s).");
+        }
+        else
+        {
+            SetStatus($"Login concluído. Importados {result.ServerCount} servidor(es) RDP em {result.GroupCount} grupo(s) do Guacamole. Cache local salvo.");
+        }
+    }
+
+    private void RemoveGuacamoleInventory()
+    {
+        DialogResult confirm = MessageBox.Show(
+            this,
+            "Deseja remover o inventário local do Guacamole deste computador? As conexões precisarão ser importadas novamente.",
+            "Remover inventário do Guacamole",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+
+        if (confirm != DialogResult.Yes)
+        {
+            return;
+        }
+
+        if (!ConfirmCloseSessions() || !ConfirmDiscardChanges())
+        {
+            return;
+        }
+
+        try
+        {
+            GuacamoleInventoryCache.Delete();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                $"Não foi possível excluir o cache do Guacamole: {ex.Message}",
+                "Erro ao remover inventário",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return;
+        }
+
+        if (GuacamoleInventoryCache.Exists())
+        {
+            MessageBox.Show(
+                this,
+                "O arquivo de cache do Guacamole não pôde ser removido (pode estar em uso por outro processo).",
+                "Erro ao remover inventário",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return;
+        }
+
+        _guacamoleReferences.Clear();
+        _document = RdgDocument.CreateNew();
+        _isGuacamoleInventory = false;
+        _isGuacamoleInventoryModified = false;
+
+        PopulateTree();
+        UpdateTitle();
+        UpdateCommands();
+        SetStatus("Inventário local do Guacamole removido.");
+    }
+
+    private string? GetActiveGuacamoleBaseUrl()
+    {
+        if (_guacamoleReferences.Count > 0)
+        {
+            return _guacamoleReferences.Values.FirstOrDefault()?.BaseUri.AbsoluteUri;
+        }
+
+        return null;
     }
 
     private bool SaveDocument()
@@ -383,7 +748,9 @@ internal sealed class MainForm : Form
             DefaultExt = "rdg",
             AddExtension = true,
             Title = "Salvar arquivo RDG",
-            FileName = _document.FilePath is null ? "PRDC.rdg" : Path.GetFileName(_document.FilePath)
+            FileName = _document.FilePath is null
+                ? (_isGuacamoleInventory ? "Guacamole.rdg" : "PRDC.rdg")
+                : Path.GetFileName(_document.FilePath)
         };
 
         return dialog.ShowDialog(this) == DialogResult.OK && SaveTo(dialog.FileName);
@@ -394,7 +761,9 @@ internal sealed class MainForm : Form
         try
         {
             _document.Save(filePath);
+            _isGuacamoleInventoryModified = false;
             UpdateTitle();
+            UpdateCommands();
             SetStatus($"Salvo: {filePath}");
             return true;
         }
@@ -487,10 +856,21 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void ConnectSelectedServer()
+    private async void ConnectSelectedServer()
+    {
+        await ConnectSelectedServerAsync();
+    }
+
+    internal async Task ConnectSelectedServerAsync()
     {
         RdgNode? server = SelectedNode;
-        if (server?.Kind != RdgNodeKind.Server || string.IsNullOrWhiteSpace(server.HostName))
+        if (server?.Kind != RdgNodeKind.Server)
+        {
+            return;
+        }
+
+        bool isGuacamole = _guacamoleReferences.ContainsKey(server.Element);
+        if (!isGuacamole && string.IsNullOrWhiteSpace(server.HostName))
         {
             return;
         }
@@ -508,8 +888,21 @@ internal sealed class MainForm : Form
                 return;
             }
 
-            session.Host.ConnectTo(server.HostName);
+            if (session.Kind == SessionKind.GuacamoleWeb)
+            {
+                UpdateCommands();
+                await session.GuacamoleHost!.ConnectAsync();
+            }
+            else
+            {
+                session.RdpHost!.ConnectTo(server.HostName);
+            }
+
             UpdateCommands();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Encerramento normal da aba/formulário durante inicialização assíncrona.
         }
         catch (Exception exception) when (
             exception is InvalidOperationException
@@ -517,13 +910,23 @@ internal sealed class MainForm : Form
                 or System.Runtime.InteropServices.InvalidComObjectException
                 or TargetInvocationException)
         {
+            if (IsDisposed || Disposing)
+            {
+                return;
+            }
+
+            string errorMessage = exception is TargetInvocationException && exception.InnerException is not null
+                ? exception.InnerException.Message
+                : exception.Message;
             MessageBox.Show(
                 this,
-                exception.InnerException?.Message ?? exception.Message,
+                errorMessage,
                 "Erro ao conectar",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
-            SetStatus("Falha ao iniciar a conexão RDP.");
+            SetStatus(isGuacamole
+                ? "Falha ao iniciar a sessão do Apache Guacamole."
+                : "Falha ao iniciar a conexão RDP.");
             UpdateCommands();
         }
     }
@@ -538,12 +941,14 @@ internal sealed class MainForm : Form
 
         try
         {
-            session.Host.DisconnectSession();
+            session.Disconnect();
         }
         catch (Exception exception) when (
             exception is System.Runtime.InteropServices.COMException
                 or System.Runtime.InteropServices.InvalidComObjectException
-                or TargetInvocationException)
+                or TargetInvocationException
+                or ObjectDisposedException
+                or InvalidOperationException)
         {
             MessageBox.Show(
                 this,
@@ -554,27 +959,73 @@ internal sealed class MainForm : Form
         }
         finally
         {
+            UpdateConnectionViews();
             UpdateCommands();
         }
     }
 
-    private void ReconnectSession()
+    private async void ReconnectSession()
+    {
+        await ReconnectSessionAsync();
+    }
+
+    internal async Task ReconnectSessionAsync()
     {
         RdpSession? session = GetCommandSession();
-        if (session is null || !IsSessionActive(session) || string.IsNullOrWhiteSpace(session.Host.Server))
+        if (session is null || !CanReconnectSession(session))
         {
             return;
         }
 
-        string server = session.Host.Server;
-        RdpClientHost previousHost = session.Host;
-        previousHost.ConnectionStateChanged -= OnRdpConnectionStateChanged;
+        if (session.Kind == SessionKind.GuacamoleWeb)
+        {
+            try
+            {
+                UpdateCommands();
+                await session.GuacamoleHost!.ReconnectAsync();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Encerramento normal da aba/formulário durante reconexão assíncrona.
+            }
+            catch (Exception exception) when (
+                exception is InvalidOperationException
+                    or System.Runtime.InteropServices.COMException)
+            {
+                if (IsDisposed || Disposing)
+                {
+                    return;
+                }
+
+                MessageBox.Show(
+                    this,
+                    exception.Message,
+                    "Erro ao reconectar",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                SetStatus("Falha ao reconectar a sessão do Apache Guacamole.");
+            }
+            finally
+            {
+                if (!IsDisposed && !Disposing)
+                {
+                    UpdateSessionTitles();
+                    UpdateConnectionViews();
+                    UpdateCommands();
+                }
+            }
+
+            return;
+        }
+
+        string server = session.RdpHost!.Server;
+        session.DetachStateChanged(OnRdpConnectionStateChanged);
 
         try
         {
-            session.ReplaceHost();
-            session.Host.ConnectionStateChanged += OnRdpConnectionStateChanged;
-            session.Host.ConnectTo(server);
+            session.ReplaceNativeHost();
+            session.AttachStateChanged(OnRdpConnectionStateChanged);
+            session.RdpHost.ConnectTo(server);
             SetStatus($"Reconectando a {session.DisplayName}...");
         }
         catch (Exception exception) when (
@@ -583,7 +1034,7 @@ internal sealed class MainForm : Form
                 or System.Runtime.InteropServices.InvalidComObjectException
                 or TargetInvocationException)
         {
-            session.Host.ConnectionStateChanged -= OnRdpConnectionStateChanged;
+            session.DetachStateChanged(OnRdpConnectionStateChanged);
             MessageBox.Show(
                 this,
                 exception.InnerException?.Message ?? exception.Message,
@@ -603,7 +1054,7 @@ internal sealed class MainForm : Form
     private async void LogOffSession()
     {
         RdpSession? session = GetCommandSession();
-        if (session?.Host.ConnectionState != RdpConnectionState.LoggedIn)
+        if (session is not { SupportsLogOff: true, ConnectionState: RdpConnectionState.LoggedIn, RdpHost: not null })
         {
             return;
         }
@@ -622,7 +1073,7 @@ internal sealed class MainForm : Form
         try
         {
             SetStatus($"Solicitando logoff em {session.DisplayName}...");
-            Task operation = session.Host.LogOffSessionAsync();
+            Task operation = session.RdpHost.LogOffSessionAsync();
             UpdateCommands();
             await operation;
             SetStatus($"Logoff solicitado em {session.DisplayName}.");
@@ -855,7 +1306,7 @@ internal sealed class MainForm : Form
     private void OnRdpConnectionStateChanged(object? sender, RdpConnectionStateChangedEventArgs eventArgs)
     {
         RdpSession? session = _sessions.Values.FirstOrDefault(
-            candidate => ReferenceEquals(candidate.Host, sender));
+            candidate => candidate.OwnsHost(sender));
         if (session is null)
         {
             return;
@@ -866,13 +1317,13 @@ internal sealed class MainForm : Form
         {
             session.ClearThumbnail();
         }
-        else if (eventArgs.State is RdpConnectionState.Connected or RdpConnectionState.LoggedIn)
+        else if (session.SupportsThumbnail && eventArgs.State is RdpConnectionState.Connected or RdpConnectionState.LoggedIn)
         {
             UpdateThumbnail(session);
             _thumbnailTimer.Start();
         }
 
-        if (!_sessions.Values.Any(IsSessionConnected))
+        if (!_sessions.Values.Any(candidate => candidate.SupportsThumbnail && IsSessionConnected(candidate)))
         {
             _thumbnailTimer.Stop();
         }
@@ -903,6 +1354,7 @@ internal sealed class MainForm : Form
         }
 
         CloseSessionsFor(node.Element);
+        RemoveGuacamoleReferencesFor(node.Element);
         _document.Remove(node);
         PopulateTree();
         MarkChanged("Item removido.");
@@ -1002,15 +1454,30 @@ internal sealed class MainForm : Form
     {
         RdgNode? node = SelectedNode;
         _nodeTitle.Text = node?.Name ?? "Nenhum item selecionado";
-        _nodeType.Text = node?.Kind switch
-        {
-            RdgNodeKind.File => "Arquivo RDG",
-            RdgNodeKind.Group => "Grupo",
-            RdgNodeKind.Server => "Servidor",
-            _ => string.Empty
-        };
-        _nodeHost.Text = node?.Kind == RdgNodeKind.Server ? $"Host: {node.HostName}" : string.Empty;
         bool isServer = node?.Kind == RdgNodeKind.Server;
+        GuacamoleConnectionReference? guacamoleReference = isServer
+            && _guacamoleReferences.TryGetValue(node!.Element, out GuacamoleConnectionReference? foundRef)
+                ? foundRef
+                : null;
+
+        if (guacamoleReference is not null)
+        {
+            _nodeTitle.Text = guacamoleReference.DisplayName;
+            _nodeType.Text = $"Origem: Apache Guacamole | Protocolo: {guacamoleReference.Protocol} | DataSource: {guacamoleReference.DataSource}";
+            _nodeHost.Text = $"Endereço: {guacamoleReference.BaseUri}";
+        }
+        else
+        {
+            _nodeType.Text = node?.Kind switch
+            {
+                RdgNodeKind.File => "Arquivo RDG",
+                RdgNodeKind.Group => "Grupo",
+                RdgNodeKind.Server => "Servidor",
+                _ => string.Empty
+            };
+            _nodeHost.Text = isServer ? $"Host: {node!.HostName}" : string.Empty;
+        }
+
         RdpConnectionState state = isServer ? GetConnectionState(node!) : RdpConnectionState.Disconnected;
         RdpSession? session = isServer ? GetSession(node!) : null;
         _connectionState.Visible = isServer;
@@ -1018,20 +1485,31 @@ internal sealed class MainForm : Form
         _thumbnailTitle.Visible = isServer;
         _thumbnail.Visible = isServer;
         _thumbnailStatus.Visible = isServer;
-        _thumbnailTitle.Text = session is not null
-            ? $"Miniatura da sessão - {session.Host.Server}"
-            : "Miniatura da sessão";
-        _thumbnail.Image = session?.Thumbnail;
-        _thumbnailStatus.Text = isServer
-            ? state switch
-            {
-                RdpConnectionState.Connecting => "Aguardando a conexão para gerar a miniatura.",
-                RdpConnectionState.Connected or RdpConnectionState.LoggedIn when session?.Thumbnail is null =>
-                    "Capturando a sessão remota...",
-                RdpConnectionState.Connected or RdpConnectionState.LoggedIn => "Atualizada automaticamente a cada segundo.",
-                _ => "Sem sessão ativa."
-            }
-            : string.Empty;
+
+        if (guacamoleReference is not null)
+        {
+            _thumbnailTitle.Text = $"Miniatura da sessão - {guacamoleReference.DisplayName}";
+            _thumbnail.Image = null;
+            _thumbnailStatus.Text = "Sessão web via Apache Guacamole.";
+        }
+        else
+        {
+            _thumbnailTitle.Text = session?.RdpHost is not null
+                ? $"Miniatura da sessão - {session.RdpHost.Server}"
+                : "Miniatura da sessão";
+            _thumbnail.Image = session?.Thumbnail;
+            _thumbnailStatus.Text = isServer
+                ? state switch
+                {
+                    RdpConnectionState.Connecting => "Aguardando a conexão para gerar a miniatura.",
+                    RdpConnectionState.Connected or RdpConnectionState.LoggedIn when session?.Thumbnail is null =>
+                        "Capturando a sessão remota...",
+                    RdpConnectionState.Connected or RdpConnectionState.LoggedIn => "Atualizada automaticamente a cada segundo.",
+                    _ => "Sem sessão ativa."
+                }
+                : string.Empty;
+        }
+
         UpdateCommands();
     }
 
@@ -1047,15 +1525,22 @@ internal sealed class MainForm : Form
         _connectMenuItem.Enabled = selected?.Kind == RdgNodeKind.Server
             && (selectedSession is null || !IsSessionActive(selectedSession));
         RdpSession? commandSession = GetCommandSession();
-        _reconnectMenuItem.Enabled = commandSession is not null && IsSessionActive(commandSession);
+        _reconnectMenuItem.Enabled = commandSession is not null && CanReconnectSession(commandSession);
         _disconnectMenuItem.Enabled = commandSession is not null && IsSessionActive(commandSession);
-        _logOffMenuItem.Enabled = commandSession?.Host.ConnectionState == RdpConnectionState.LoggedIn
-            && !commandSession.Host.IsLogOffPending;
+        _logOffMenuItem.Enabled = commandSession is
+        {
+            SupportsLogOff: true,
+            ConnectionState: RdpConnectionState.LoggedIn,
+            IsLogOffPending: false
+        };
         _closeSessionTabMenuItem.Enabled = _sessionTabs.SelectedTab?.Tag is RdpSession;
         _connectButton.Enabled = _connectMenuItem.Enabled;
         _disconnectButton.Enabled = _disconnectMenuItem.Enabled;
         _saveMenuItem.Enabled = true;
         _saveAsMenuItem.Enabled = true;
+        _refreshGuacamoleMenuItem.Enabled = GuacamoleInventoryCache.Exists()
+            || (_isGuacamoleInventory && GetActiveGuacamoleBaseUrl() is not null);
+        _removeGuacamoleMenuItem.Enabled = GuacamoleInventoryCache.Exists() || _isGuacamoleInventory;
     }
 
     private void UpdateExpanded(TreeNode? treeNode, bool expanded)
@@ -1068,9 +1553,14 @@ internal sealed class MainForm : Form
         }
     }
 
+    private bool HasUnsavedChanges =>
+        _isGuacamoleInventory
+            ? _isGuacamoleInventoryModified
+            : _document.IsDirty;
+
     private bool ConfirmDiscardChanges()
     {
-        if (!_document.IsDirty)
+        if (!HasUnsavedChanges)
         {
             return true;
         }
@@ -1153,7 +1643,7 @@ internal sealed class MainForm : Form
             return DisconnectedStatusColor;
         }
 
-        return session.Host.ConnectionState switch
+        return session.ConnectionState switch
         {
             RdpConnectionState.Connecting or RdpConnectionState.Connected => AuthenticatingStatusColor,
             RdpConnectionState.LoggedIn => IsSessionWindowOpen(session)
@@ -1171,7 +1661,7 @@ internal sealed class MainForm : Form
 
     private RdpConnectionState GetConnectionState(RdgNode server)
     {
-        return GetSession(server)?.Host.ConnectionState ?? RdpConnectionState.Disconnected;
+        return GetSession(server)?.ConnectionState ?? RdpConnectionState.Disconnected;
     }
 
     private RdpSession? GetSession(RdgNode server)
@@ -1199,8 +1689,10 @@ internal sealed class MainForm : Form
             return existing;
         }
 
-        RdpSession session = new(server.Element, server.Name);
-        session.Host.ConnectionStateChanged += OnRdpConnectionStateChanged;
+        RdpSession session = _guacamoleReferences.TryGetValue(server.Element, out GuacamoleConnectionReference? reference)
+            ? new RdpSession(server.Element, server.Name, reference)
+            : new RdpSession(server.Element, server.Name);
+        session.AttachStateChanged(OnRdpConnectionStateChanged);
         session.Page.Tag = session;
         _sessions.Add(server.Element, session);
         _sessionTabs.TabPages.Add(session.Page);
@@ -1232,22 +1724,28 @@ internal sealed class MainForm : Form
         return _sessionTabs.SelectedTab?.Tag as RdpSession;
     }
 
+    private static bool CanReconnectSession(RdpSession session)
+    {
+        return session.Kind == SessionKind.GuacamoleWeb
+            || (IsSessionActive(session) && !string.IsNullOrWhiteSpace(session.RdpHost?.Server));
+    }
+
     private static bool IsSessionActive(RdpSession session)
     {
-        return session.Host.ConnectionState is
+        return session.ConnectionState is
             RdpConnectionState.Connecting or RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
     }
 
     private static bool IsSessionConnected(RdpSession session)
     {
-        return session.Host.ConnectionState is RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
+        return session.ConnectionState is RdpConnectionState.Connected or RdpConnectionState.LoggedIn;
     }
 
     private void UpdateThumbnails()
     {
         if (!ReferenceEquals(_workspaceTabs.SelectedTab, _detailsPage)
             || SelectedNode is not { Kind: RdgNodeKind.Server } selected
-            || GetSession(selected) is not { } session
+            || GetSession(selected) is not { SupportsThumbnail: true } session
             || !IsSessionConnected(session))
         {
             return;
@@ -1258,7 +1756,12 @@ internal sealed class MainForm : Form
 
     private void UpdateThumbnail(RdpSession session)
     {
-        Bitmap? thumbnail = session.Host.CaptureThumbnail(_thumbnail.ClientSize);
+        if (!session.SupportsThumbnail || session.RdpHost is null)
+        {
+            return;
+        }
+
+        Bitmap? thumbnail = session.RdpHost.CaptureThumbnail(_thumbnail.ClientSize);
         if (thumbnail is null)
         {
             return;
@@ -1368,15 +1871,30 @@ internal sealed class MainForm : Form
         {
             try
             {
-                session.Host.DisconnectSession();
+                session.Disconnect();
             }
             catch (Exception exception) when (
                 exception is System.Runtime.InteropServices.COMException
                     or System.Runtime.InteropServices.InvalidComObjectException
-                    or TargetInvocationException)
+                    or TargetInvocationException
+                    or ObjectDisposedException
+                    or InvalidOperationException)
             {
                 SetStatus($"Falha ao desconectar {session.DisplayName}: {exception.InnerException?.Message ?? exception.Message}");
             }
+        }
+    }
+
+    private void RemoveGuacamoleReferencesFor(XElement element)
+    {
+        XElement[] keys = _guacamoleReferences.Keys
+            .Where(key => ReferenceEquals(key, element)
+                || key.Ancestors().Any(ancestor => ReferenceEquals(ancestor, element)))
+            .ToArray();
+
+        foreach (XElement key in keys)
+        {
+            _guacamoleReferences.Remove(key);
         }
     }
 
@@ -1413,18 +1931,20 @@ internal sealed class MainForm : Form
         {
             if (IsSessionActive(session))
             {
-                session.Host.DisconnectSession();
+                session.Disconnect();
             }
         }
         catch (Exception exception) when (
             exception is System.Runtime.InteropServices.COMException
                 or System.Runtime.InteropServices.InvalidComObjectException
-                or TargetInvocationException)
+                or TargetInvocationException
+                or ObjectDisposedException
+                or InvalidOperationException)
         {
             SetStatus($"Falha ao encerrar {session.DisplayName}: {exception.InnerException?.Message ?? exception.Message}");
         }
 
-        session.Host.ConnectionStateChanged -= OnRdpConnectionStateChanged;
+        session.DetachStateChanged(OnRdpConnectionStateChanged);
         _sessions.Remove(session.ServerElement);
         _sessionTabs.TabPages.Remove(session.Page);
         if (ReferenceEquals(_thumbnail.Image, session.Thumbnail))
@@ -1433,14 +1953,20 @@ internal sealed class MainForm : Form
         }
 
         session.Dispose();
-        if (_sessions.Count == 0)
+        if (_sessions.Count == 0 || !_sessions.Values.Any(candidate => candidate.SupportsThumbnail && IsSessionConnected(candidate)))
         {
             _thumbnailTimer.Stop();
+        }
+
+        if (_sessions.Count == 0)
+        {
             _sessionPanel.Controls.Clear();
             _sessionPanel.Controls.Add(_sessionPlaceholder);
         }
 
         UpdateSessionTitles();
+        UpdateConnectionViews();
+        UpdateCommands();
     }
 
     private void SetConnectionPaneMode(ConnectionPaneMode mode)
@@ -1629,14 +2155,29 @@ internal sealed class MainForm : Form
 
     private void MarkChanged(string status)
     {
-        UpdateTitle();
+        MarkDocumentModified();
         SetStatus(status);
+    }
+
+    private void MarkDocumentModified()
+    {
+        if (_isGuacamoleInventory)
+        {
+            _isGuacamoleInventoryModified = true;
+        }
+
+        UpdateTitle();
+        UpdateCommands();
     }
 
     private void UpdateTitle()
     {
-        string fileName = _document.FilePath is null ? "Novo arquivo" : Path.GetFileName(_document.FilePath);
-        Text = $"PRDC - {fileName}{(_document.IsDirty ? " *" : string.Empty)}";
+        string documentName = _document.FilePath is not null
+            ? Path.GetFileName(_document.FilePath)
+            : (_isGuacamoleInventory ? "Guacamole" : "Novo arquivo");
+
+        string dirtyMarker = HasUnsavedChanges ? "*" : string.Empty;
+        Text = $"PRDC - {documentName}{dirtyMarker}";
     }
 
     private void SetStatus(string status)
@@ -1658,26 +2199,110 @@ internal enum ConnectionPaneMode
     AutoHide
 }
 
+internal enum SessionKind
+{
+    NativeRdp,
+    GuacamoleWeb
+}
+
 internal sealed class RdpSession : IDisposable
 {
     public RdpSession(XElement serverElement, string displayName)
     {
         ServerElement = serverElement;
         DisplayName = displayName;
-        Host = new RdpClientHost();
+        Kind = SessionKind.NativeRdp;
+        RdpHost = new RdpClientHost();
         Page = new TabPage(displayName) { Padding = new Padding(3) };
-        Page.Controls.Add(Host);
+        Page.Controls.Add(RdpHost);
+    }
+
+    public RdpSession(
+        XElement serverElement,
+        string displayName,
+        GuacamoleConnectionReference guacamoleReference)
+    {
+        ServerElement = serverElement;
+        DisplayName = displayName;
+        Kind = SessionKind.GuacamoleWeb;
+        GuacamoleReference = guacamoleReference;
+        GuacamoleHost = new GuacamoleSessionHost(guacamoleReference)
+        {
+            Dock = DockStyle.Fill
+        };
+        Page = new TabPage(displayName) { Padding = new Padding(3) };
+        Page.Controls.Add(GuacamoleHost);
     }
 
     public XElement ServerElement { get; }
 
     public string DisplayName { get; set; }
 
-    public RdpClientHost Host { get; private set; }
+    public SessionKind Kind { get; }
+
+    public RdpClientHost? RdpHost { get; private set; }
+
+    public GuacamoleSessionHost? GuacamoleHost { get; }
+
+    public GuacamoleConnectionReference? GuacamoleReference { get; }
 
     public TabPage Page { get; }
 
     public Bitmap? Thumbnail { get; set; }
+
+    public RdpConnectionState ConnectionState =>
+        Kind == SessionKind.GuacamoleWeb
+            ? GuacamoleHost!.ConnectionState
+            : RdpHost!.ConnectionState;
+
+    public bool SupportsLogOff => Kind == SessionKind.NativeRdp;
+
+    public bool IsLogOffPending => Kind == SessionKind.NativeRdp && RdpHost!.IsLogOffPending;
+
+    public bool SupportsThumbnail => Kind == SessionKind.NativeRdp;
+
+    public bool OwnsHost(object? sender)
+    {
+        return Kind == SessionKind.GuacamoleWeb
+            ? ReferenceEquals(GuacamoleHost, sender)
+            : ReferenceEquals(RdpHost, sender);
+    }
+
+    public void AttachStateChanged(EventHandler<RdpConnectionStateChangedEventArgs> handler)
+    {
+        if (Kind == SessionKind.GuacamoleWeb)
+        {
+            GuacamoleHost!.ConnectionStateChanged += handler;
+        }
+        else
+        {
+            RdpHost!.ConnectionStateChanged += handler;
+        }
+    }
+
+    public void DetachStateChanged(EventHandler<RdpConnectionStateChangedEventArgs> handler)
+    {
+        if (Kind == SessionKind.GuacamoleWeb)
+        {
+            GuacamoleHost!.ConnectionStateChanged -= handler;
+        }
+        else if (RdpHost is not null)
+        {
+            RdpHost.ConnectionStateChanged -= handler;
+        }
+    }
+
+    public void Disconnect()
+    {
+        if (Kind == SessionKind.GuacamoleWeb)
+        {
+            GuacamoleHost!.DisconnectSession();
+        }
+        else
+        {
+            RdpHost!.DisconnectSession();
+        }
+    }
 
     public void ClearThumbnail()
     {
@@ -1685,12 +2310,17 @@ internal sealed class RdpSession : IDisposable
         Thumbnail = null;
     }
 
-    public void ReplaceHost()
+    public void ReplaceNativeHost()
     {
-        RdpClientHost previous = Host;
+        if (Kind != SessionKind.NativeRdp || RdpHost is null)
+        {
+            throw new InvalidOperationException("ReplaceNativeHost aplica-se apenas a sessões NativeRdp.");
+        }
+
+        RdpClientHost previous = RdpHost;
         Page.Controls.Remove(previous);
-        Host = new RdpClientHost();
-        Page.Controls.Add(Host);
+        RdpHost = new RdpClientHost();
+        Page.Controls.Add(RdpHost);
         previous.Dispose();
         ClearThumbnail();
     }
@@ -1698,6 +2328,15 @@ internal sealed class RdpSession : IDisposable
     public void Dispose()
     {
         ClearThumbnail();
+        if (Kind == SessionKind.GuacamoleWeb)
+        {
+            GuacamoleHost?.Dispose();
+        }
+        else
+        {
+            RdpHost?.Dispose();
+        }
+
         Page.Dispose();
     }
 }
