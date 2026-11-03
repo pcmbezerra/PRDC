@@ -83,6 +83,7 @@ internal sealed class GuacamoleLoginDialog : Form
 
         AcceptButton = okButton;
         CancelButton = cancelButton;
+        ThemeManager.ApplyTheme(this);
     }
 
     public string ServerUrl => _urlTextBox.Text.Trim();

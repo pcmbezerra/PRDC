@@ -76,6 +76,7 @@ internal sealed class NodeDialog : Form
 
         AcceptButton = okButton;
         CancelButton = cancelButton;
+        ThemeManager.ApplyTheme(this);
     }
 
     public string NodeName => _nameTextBox.Text.Trim();

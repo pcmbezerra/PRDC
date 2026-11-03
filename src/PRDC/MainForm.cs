@@ -1,6 +1,7 @@
 using System.Drawing.Drawing2D;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Xml;
 using System.Xml.Linq;
@@ -73,8 +74,15 @@ internal sealed class MainForm : Form
     private readonly ToolStripMenuItem _showConnectionPaneMenuItem = new("&Mostrar");
     private readonly ToolStripMenuItem _hideConnectionPaneMenuItem = new("&Ocultar");
     private readonly ToolStripMenuItem _autoHideConnectionPaneMenuItem = new("Ocultar &automaticamente");
-    private readonly ToolStripButton _connectButton = new("Conectar");
-    private readonly ToolStripButton _disconnectButton = new("Desconectar");
+    private readonly StatusStrip _statusStrip = new();
+    private readonly ToolStripMenuItem _fullScreenMenuItem = new("Tela &cheia");
+    private readonly ToolStripMenuItem _lightThemeMenuItem = new("&Claro");
+    private readonly ToolStripMenuItem _darkThemeMenuItem = new("&Escuro");
+    private readonly ToolStripMenuItem _systemThemeMenuItem = new("&Usar tema do Windows");
+    private bool _isFullScreen;
+    private FormWindowState _previousWindowState = FormWindowState.Normal;
+    private FormBorderStyle _previousBorderStyle = FormBorderStyle.Sizable;
+    private Rectangle _previousBounds;
     private readonly TabControl _workspaceTabs = new() { Dock = DockStyle.Fill };
     private readonly TabPage _detailsPage = new("Detalhes") { Padding = new Padding(3) };
     private readonly TabPage _sessionPage = new("Sessões") { Padding = new Padding(3) };
@@ -123,9 +131,9 @@ internal sealed class MainForm : Form
         MainMenuStrip = BuildMenu();
         Controls.Add(BuildWorkspace());
         _workspaceSplit!.Panel2MinSize = 300;
-        Controls.Add(BuildToolStrip());
         Controls.Add(MainMenuStrip);
-        Controls.Add(new StatusStrip { Items = { _statusLabel } });
+        _statusStrip.Items.Add(_statusLabel);
+        Controls.Add(_statusStrip);
 
         _tree.DrawNode += DrawTreeNode;
         _tree.AfterSelect += (_, _) => UpdateSelection();
@@ -134,6 +142,8 @@ internal sealed class MainForm : Form
         _tree.NodeMouseDoubleClick += (_, _) => ActivateSelectedNode();
         _tree.ContextMenuStrip = BuildContextMenu();
         _thumbnailTimer.Tick += (_, _) => UpdateThumbnails();
+        _workspaceTabs.DrawMode = TabDrawMode.OwnerDrawFixed;
+        _workspaceTabs.DrawItem += DrawWorkspaceTab;
         _workspaceTabs.SelectedIndexChanged += (_, _) =>
         {
             _tree.Invalidate();
@@ -155,6 +165,7 @@ internal sealed class MainForm : Form
         _autoHideConnectionPaneButton.Click += (_, _) => ExpandAutoHideConnectionPane();
         _autoHideTimer.Tick += (_, _) => UpdateAutoHideConnectionPane();
 
+        ThemeManager.ThemeChanged += ApplyCurrentTheme;
         Shown += OnShown;
         SizeChanged += (_, _) => ClampConnectionPaneWidth();
         FormClosing += OnFormClosing;
@@ -162,6 +173,7 @@ internal sealed class MainForm : Form
         PopulateTree();
         UpdateTitle();
         SetStatus("Pronto.");
+        ApplyCurrentTheme();
     }
 
     private MenuStrip BuildMenu()
@@ -232,8 +244,28 @@ internal sealed class MainForm : Form
             _hideConnectionPaneMenuItem,
             _autoHideConnectionPaneMenuItem
         ]);
-        view.DropDownItems.Add(connectionPane);
+
+        _fullScreenMenuItem.Click += (_, _) => ToggleFullScreen();
+        _fullScreenMenuItem.ShortcutKeys = Keys.F11;
+
+        ToolStripMenuItem themeMenu = new("T&ema");
+        _lightThemeMenuItem.Click += (_, _) => ThemeManager.SetTheme(AppTheme.Light);
+        _darkThemeMenuItem.Click += (_, _) => ThemeManager.SetTheme(AppTheme.Dark);
+        _systemThemeMenuItem.Click += (_, _) => ThemeManager.SetTheme(AppTheme.System);
+        themeMenu.DropDownItems.AddRange([
+            _lightThemeMenuItem,
+            _darkThemeMenuItem,
+            _systemThemeMenuItem
+        ]);
+
+        view.DropDownItems.AddRange([
+            connectionPane,
+            new ToolStripSeparator(),
+            _fullScreenMenuItem,
+            themeMenu
+        ]);
         UpdateConnectionPaneMenu();
+        UpdateThemeMenu();
 
         ToolStripMenuItem session = new("&Sessão");
         _connectMenuItem.Click += (_, _) => ConnectSelectedServer();
@@ -260,25 +292,6 @@ internal sealed class MainForm : Form
 
         menu.Items.AddRange([file, edit, view, session, help]);
         return menu;
-    }
-
-    private ToolStrip BuildToolStrip()
-    {
-        ToolStrip toolStrip = new() { GripStyle = ToolStripGripStyle.Hidden };
-        toolStrip.Items.Add(new ToolStripButton("Novo", null, (_, _) => NewDocument()));
-        toolStrip.Items.Add(new ToolStripButton("Abrir", null, (_, _) => OpenDocument()));
-        toolStrip.Items.Add(new ToolStripButton("Salvar", null, (_, _) => SaveDocument()));
-        toolStrip.Items.Add(new ToolStripSeparator());
-        toolStrip.Items.Add(new ToolStripButton("Grupo", null, (_, _) => AddGroup()));
-        toolStrip.Items.Add(new ToolStripButton("Servidor", null, (_, _) => AddServer()));
-        toolStrip.Items.Add(new ToolStripButton("Editar", null, (_, _) => EditSelectedNode()));
-        toolStrip.Items.Add(new ToolStripButton("Remover", null, (_, _) => RemoveSelectedNode()));
-        toolStrip.Items.Add(new ToolStripSeparator());
-        _connectButton.Click += (_, _) => ConnectSelectedServer();
-        _disconnectButton.Click += (_, _) => DisconnectSession();
-        toolStrip.Items.Add(_connectButton);
-        toolStrip.Items.Add(_disconnectButton);
-        return toolStrip;
     }
 
     private Control BuildWorkspace()
@@ -915,15 +928,13 @@ internal sealed class MainForm : Form
                 return;
             }
 
-            string errorMessage = exception is TargetInvocationException && exception.InnerException is not null
-                ? exception.InnerException.Message
-                : exception.Message;
+            var (title, message, icon) = FormatConnectionErrorMessage(exception, isGuacamole, isReconnect: false);
             MessageBox.Show(
                 this,
-                errorMessage,
-                "Erro ao conectar",
+                message,
+                title,
                 MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+                icon);
             SetStatus(isGuacamole
                 ? "Falha ao iniciar a sessão do Apache Guacamole."
                 : "Falha ao iniciar a conexão RDP.");
@@ -1035,12 +1046,13 @@ internal sealed class MainForm : Form
                 or TargetInvocationException)
         {
             session.DetachStateChanged(OnRdpConnectionStateChanged);
+            var (title, message, icon) = FormatConnectionErrorMessage(exception, isGuacamole: false, isReconnect: true);
             MessageBox.Show(
                 this,
-                exception.InnerException?.Message ?? exception.Message,
-                "Erro ao reconectar",
+                message,
+                title,
                 MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+                icon);
             SetStatus("Falha ao reconectar a sessão RDP.");
         }
         finally
@@ -1049,6 +1061,33 @@ internal sealed class MainForm : Form
             UpdateConnectionViews();
             UpdateCommands();
         }
+    }
+
+    private static (string Title, string Message, MessageBoxIcon Icon) FormatConnectionErrorMessage(
+        Exception exception,
+        bool isGuacamole,
+        bool isReconnect)
+    {
+        Exception root = exception is TargetInvocationException tie && tie.InnerException is not null
+            ? tie.InnerException
+            : exception;
+
+        if (root is COMException comEx && ((uint)comEx.HResult is 0x80040111 or 0x80040154))
+        {
+            string detail = (uint)comEx.HResult switch
+            {
+                0x80040111 => "O controle ActiveX do Microsoft Remote Desktop (mstscax.dll) não pôde fornecer uma classe compatível neste sistema operacional.\n\n" +
+                              "Verifique se o cliente de Área de Trabalho Remota do Windows está instalado e atualizado, ou utilize conexões via Apache Guacamole.",
+                0x80040154 => "O controle ActiveX do Microsoft Remote Desktop (mstscax.dll) não está registrado no sistema operacional.\n\n" +
+                              "Execute 'regsvr32 %windir%\\system32\\mstscax.dll' em um prompt de comando elevado para registrar o componente, ou utilize conexões via Apache Guacamole.",
+                _ => root.Message
+            };
+
+            return ("Cliente RDP Indisponível", detail, MessageBoxIcon.Warning);
+        }
+
+        string defaultTitle = isReconnect ? "Erro ao reconectar" : "Erro ao conectar";
+        return (defaultTitle, root.Message, MessageBoxIcon.Error);
     }
 
     private async void LogOffSession()
@@ -1202,8 +1241,13 @@ internal sealed class MainForm : Form
         }
 
         TabPage page = _sessionTabs.TabPages[eventArgs.Index];
+        bool isDark = ThemeManager.IsDark;
         bool selected = (eventArgs.State & DrawItemState.Selected) == DrawItemState.Selected;
-        Color background = selected ? SystemColors.Window : SystemColors.Control;
+        Color background = isDark
+            ? (selected ? ThemeManager.ControlBackground : ThemeManager.SurfaceBackground)
+            : (selected ? SystemColors.Window : SystemColors.Control);
+        Color textColor = isDark ? ThemeManager.TextPrimary : SystemColors.ControlText;
+
         using (SolidBrush backgroundBrush = new(background))
         {
             eventArgs.Graphics.FillRectangle(backgroundBrush, eventArgs.Bounds);
@@ -1230,7 +1274,7 @@ internal sealed class MainForm : Form
             page.Text,
             Font,
             textBounds,
-            SystemColors.ControlText,
+            textColor,
             TextFormatFlags.Left
                 | TextFormatFlags.VerticalCenter
                 | TextFormatFlags.SingleLine
@@ -1238,7 +1282,7 @@ internal sealed class MainForm : Form
                 | TextFormatFlags.NoPrefix);
 
         const int glyphInset = 4;
-        using Pen closePen = new(SystemColors.ControlText, 1.5F);
+        using Pen closePen = new(textColor, 1.5F);
         eventArgs.Graphics.DrawLine(
             closePen,
             closeButton.Left + glyphInset,
@@ -1252,7 +1296,44 @@ internal sealed class MainForm : Form
             closeButton.Left + glyphInset,
             closeButton.Bottom - glyphInset - 1);
 
-        if (selected)
+        if (selected && !isDark)
+        {
+            ControlPaint.DrawFocusRectangle(eventArgs.Graphics, eventArgs.Bounds);
+        }
+    }
+
+    private void DrawWorkspaceTab(object? sender, DrawItemEventArgs eventArgs)
+    {
+        if (eventArgs.Index < 0 || eventArgs.Index >= _workspaceTabs.TabPages.Count)
+        {
+            return;
+        }
+
+        TabPage page = _workspaceTabs.TabPages[eventArgs.Index];
+        bool isDark = ThemeManager.IsDark;
+        bool selected = (eventArgs.State & DrawItemState.Selected) == DrawItemState.Selected;
+        Color background = isDark
+            ? (selected ? ThemeManager.ControlBackground : ThemeManager.SurfaceBackground)
+            : (selected ? SystemColors.Window : SystemColors.Control);
+        Color textColor = isDark ? ThemeManager.TextPrimary : SystemColors.ControlText;
+
+        using (SolidBrush backgroundBrush = new(background))
+        {
+            eventArgs.Graphics.FillRectangle(backgroundBrush, eventArgs.Bounds);
+        }
+
+        TextRenderer.DrawText(
+            eventArgs.Graphics,
+            page.Text,
+            Font,
+            eventArgs.Bounds,
+            textColor,
+            TextFormatFlags.HorizontalCenter
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.SingleLine
+                | TextFormatFlags.NoPrefix);
+
+        if (selected && !isDark)
         {
             ControlPaint.DrawFocusRectangle(eventArgs.Graphics, eventArgs.Bounds);
         }
@@ -1534,8 +1615,6 @@ internal sealed class MainForm : Form
             IsLogOffPending: false
         };
         _closeSessionTabMenuItem.Enabled = _sessionTabs.SelectedTab?.Tag is RdpSession;
-        _connectButton.Enabled = _connectMenuItem.Enabled;
-        _disconnectButton.Enabled = _disconnectMenuItem.Enabled;
         _saveMenuItem.Enabled = true;
         _saveAsMenuItem.Enabled = true;
         _refreshGuacamoleMenuItem.Enabled = GuacamoleInventoryCache.Exists()
@@ -1617,9 +1696,140 @@ internal sealed class MainForm : Form
 
     private void OnFormClosed(object? sender, FormClosedEventArgs eventArgs)
     {
+        ThemeManager.ThemeChanged -= ApplyCurrentTheme;
         _thumbnailTimer.Dispose();
         _autoHideTimer.Dispose();
         CloseAllSessions();
+    }
+
+    public bool IsFullScreen => _isFullScreen;
+
+    public void ToggleFullScreen()
+    {
+        if (_isFullScreen)
+        {
+            ExitFullScreen();
+        }
+        else
+        {
+            EnterFullScreen();
+        }
+    }
+
+    public void EnterFullScreen()
+    {
+        if (_isFullScreen)
+        {
+            return;
+        }
+
+        _previousWindowState = WindowState;
+        _previousBorderStyle = FormBorderStyle;
+        _previousBounds = Bounds;
+        _isFullScreen = true;
+
+        if (_fullScreenMenuItem is not null)
+        {
+            _fullScreenMenuItem.Checked = true;
+        }
+
+        if (MainMenuStrip is not null)
+        {
+            MainMenuStrip.Visible = false;
+        }
+
+        _statusStrip.Visible = false;
+
+        WindowState = FormWindowState.Normal;
+        FormBorderStyle = FormBorderStyle.None;
+        Bounds = Screen.FromControl(this).Bounds;
+    }
+
+    public void ExitFullScreen()
+    {
+        if (!_isFullScreen)
+        {
+            return;
+        }
+
+        _isFullScreen = false;
+
+        if (_fullScreenMenuItem is not null)
+        {
+            _fullScreenMenuItem.Checked = false;
+        }
+
+        FormBorderStyle = _previousBorderStyle;
+        if (_previousWindowState == FormWindowState.Maximized)
+        {
+            WindowState = FormWindowState.Maximized;
+        }
+        else
+        {
+            WindowState = FormWindowState.Normal;
+            if (!_previousBounds.IsEmpty)
+            {
+                Bounds = _previousBounds;
+            }
+        }
+
+        if (MainMenuStrip is not null)
+        {
+            MainMenuStrip.Visible = true;
+        }
+
+        _statusStrip.Visible = true;
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.F11)
+        {
+            ToggleFullScreen();
+            return true;
+        }
+
+        if (keyData == Keys.Escape && _isFullScreen)
+        {
+            ExitFullScreen();
+            return true;
+        }
+
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_SETTINGCHANGE = 0x001A;
+        const int WM_THEMECHANGED = 0x031A;
+
+        if (m.Msg is WM_SETTINGCHANGE or WM_THEMECHANGED)
+        {
+            if (ThemeManager.CurrentTheme == AppTheme.System)
+            {
+                ThemeManager.NotifySystemThemeChanged();
+            }
+        }
+
+        base.WndProc(ref m);
+    }
+
+    private void ApplyCurrentTheme()
+    {
+        ThemeManager.ApplyTheme(this);
+        UpdateThemeMenu();
+        _workspaceTabs.Invalidate();
+        _sessionTabs.Invalidate();
+        _tree.Invalidate();
+        _thumbnail.BackColor = Color.Black;
+        _sessionPlaceholder.ForeColor = ThemeManager.TextMuted;
+    }
+
+    private void UpdateThemeMenu()
+    {
+        _lightThemeMenuItem.Checked = ThemeManager.CurrentTheme == AppTheme.Light;
+        _darkThemeMenuItem.Checked = ThemeManager.CurrentTheme == AppTheme.Dark;
+        _systemThemeMenuItem.Checked = ThemeManager.CurrentTheme == AppTheme.System;
     }
 
     private void UpdateConnectionViews()

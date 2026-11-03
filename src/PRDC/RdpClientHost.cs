@@ -23,7 +23,40 @@ internal sealed class RdpConnectionStateChangedEventArgs(
 
 internal sealed class RdpClientHost : AxHost
 {
-    private const string MsRdpClient10NotSafeClassId = "A0C63C30-F08D-4AB4-907C-34905D770C7D";
+    internal sealed record RdpControlDescriptor(
+        string DisplayName,
+        string ClassId,
+        int VersionNumber,
+        bool IsRedistributable);
+
+    private static readonly RdpControlDescriptor[] CandidateControls =
+    [
+        // 1. MsRdpClient11 (Windows 11 builds modernos)
+        new("Microsoft RDP Client Control - version 11", "A0C63C30-F08D-4AB4-907C-34905D770C7D", 11, false),
+        new("Microsoft RDP Client Control (redistributable) - version 11", "C0EFA91A-EEB7-41C7-97FA-F0ED645EFB24", 11, true),
+
+        // 2. MsRdpClient10 (Windows 10 / Server 2019 / Server 2022 / Windows 11)
+        new("Microsoft RDP Client Control - version 10", "8B918B82-7985-4C24-89DF-C33AD2BBFBCD", 10, false),
+        new("Microsoft RDP Client Control (redistributable) - version 10", "301B94BA-5D25-4A12-BFFE-3B6E7A616585", 10, true),
+
+        // 3. MsRdpClient9 (Windows 8.1 / Windows 10 RTM / Server 2016)
+        new("Microsoft RDP Client Control - version 9", "A3BC03A0-041D-42E3-AD22-882B7865C9C5", 9, false),
+        new("Microsoft RDP Client Control (redistributable) - version 9", "5F681803-2900-4C43-A1CC-CF405404A676", 9, true),
+
+        // 4. MsRdpClient8 (Windows 8 / Server 2012)
+        new("Microsoft RDP Client Control - version 8", "54d38bf7-b1ef-4479-9674-1bd6ea465258", 8, false),
+        new("Microsoft RDP Client Control (redistributable) - version 8", "a9d7038d-b5ed-472e-9c47-94bea90a5910", 8, true),
+
+        // 5. MsRdpClient7 (Windows 7 SP1 / Server 2008 R2)
+        new("Microsoft RDP Client Control - version 7", "d2ea46a7-c2bf-426b-af24-e19c44456399", 7, false),
+        new("Microsoft RDP Client Control (redistributable) - version 7", "7390f3d8-0439-4c05-91e3-cf5cb290c3d0", 7, true),
+
+        // 6. MsRdpClient6 (Fallback legado)
+        new("Microsoft RDP Client Control - version 6", "4eb2f086-c818-447e-b32c-c51ce2b30d31", 6, false),
+        new("Microsoft RDP Client Control (redistributable) - version 6", "4eb89ff4-7f78-4a0f-8b8d-2bf02e94e4b2", 6, true)
+    ];
+
+    private static readonly Lazy<RdpControlDescriptor?> ActiveControlDescriptor = new(DiscoverSupportedControl);
     private const uint PrintWindowRenderFullContent = 0x00000002;
     private const int MinimumSessionDimension = 200;
     private const int LeftWindowsScanCode = 0x5B;
@@ -43,11 +76,128 @@ internal sealed class RdpClientHost : AxHost
     private string _lastStateMessage = string.Empty;
     private Size _lastSessionSize;
 
-    public RdpClientHost() : base(MsRdpClient10NotSafeClassId)
+    public static RdpControlDescriptor? ActiveDescriptor => ActiveControlDescriptor.Value;
+
+    public static bool IsRdpAvailable => ActiveControlDescriptor.Value is not null;
+
+    public static string ActiveClassId => GetActiveRdpClassId();
+
+    public static string ActiveVersionName => ActiveControlDescriptor.Value?.DisplayName ?? "Indisponível";
+
+    public static int ActiveVersionNumber => ActiveControlDescriptor.Value?.VersionNumber ?? 0;
+
+    public RdpClientHost() : base(GetActiveRdpClassId())
     {
         Dock = DockStyle.Fill;
         _stateTimer.Tick += (_, _) => PollState();
         _resizeTimer.Tick += (_, _) => ApplySessionSize();
+    }
+
+    internal static string GetActiveRdpClassId()
+    {
+        string? testOverride = Environment.GetEnvironmentVariable("PRDC_TEST_RDP_CLSID");
+        if (!string.IsNullOrWhiteSpace(testOverride))
+        {
+            if (string.Equals(testOverride, "NONE", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new COMException(
+                    "Nenhuma versão compatível do controle ActiveX do cliente RDP da Microsoft (mstscax.dll) foi encontrada ou pôde ser inicializada neste sistema operacional.",
+                    unchecked((int)0x80040111));
+            }
+
+            return testOverride.Trim();
+        }
+
+        RdpControlDescriptor? descriptor = ActiveControlDescriptor.Value;
+        if (descriptor is null)
+        {
+            throw new COMException(
+                "Nenhuma versão compatível do controle ActiveX do cliente RDP da Microsoft (mstscax.dll) foi encontrada ou pôde ser inicializada neste sistema operacional.",
+                unchecked((int)0x80040111));
+        }
+
+        return descriptor.ClassId;
+    }
+
+    private static RdpControlDescriptor? DiscoverSupportedControl()
+    {
+        return ProbeControlInternal(null);
+    }
+
+    internal static RdpControlDescriptor? ProbeControlForTesting(string? excludeVersions = null)
+    {
+        return ProbeControlInternal(excludeVersions);
+    }
+
+    private static RdpControlDescriptor? ProbeControlInternal(string? excludeVersions)
+    {
+        string? envExclude = Environment.GetEnvironmentVariable("PRDC_TEST_RDP_EXCLUDE_VERSIONS");
+        string? effectiveExclude = string.IsNullOrWhiteSpace(excludeVersions) ? envExclude : excludeVersions;
+
+        HashSet<int> excludedVersions = [];
+        if (!string.IsNullOrWhiteSpace(effectiveExclude))
+        {
+            foreach (string part in effectiveExclude.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (int.TryParse(part, out int verNum))
+                {
+                    excludedVersions.Add(verNum);
+                }
+            }
+        }
+
+        foreach (RdpControlDescriptor candidate in CandidateControls)
+        {
+            if (excludedVersions.Contains(candidate.VersionNumber))
+            {
+                continue;
+            }
+
+            if (TryProbeControl(candidate.ClassId))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryProbeControl(string classId)
+    {
+        if (!Guid.TryParse(classId, out Guid clsid))
+        {
+            return false;
+        }
+
+        Type? comType = Type.GetTypeFromCLSID(clsid, throwOnError: false);
+        if (comType is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            object? instance = Activator.CreateInstance(comType);
+            if (instance is not null)
+            {
+                if (Marshal.IsComObject(instance))
+                {
+                    Marshal.ReleaseComObject(instance);
+                }
+
+                return true;
+            }
+        }
+        catch (COMException)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+
+        return false;
     }
 
     public event EventHandler<RdpConnectionStateChangedEventArgs>? ConnectionStateChanged;
@@ -114,10 +264,18 @@ internal sealed class RdpClientHost : AxHost
         SetOptionalProperty(client, "ConnectingText", $"Conectando a {Server}...");
         SetOptionalProperty(client, "ConnectedStatusText", $"Conectado a {Server}");
         SetOptionalProperty(client, "DisconnectedText", $"Desconectado de {Server}");
-        object securedSettings = GetProperty(client, "SecuredSettings2")
-            ?? throw new InvalidOperationException("O controle RDP não oferece as configurações de teclado necessárias.");
-        SetProperty(securedSettings, "KeyboardHookMode", 1);
-        object? advancedSettings = GetOptionalProperty(client, "AdvancedSettings9");
+        object? securedSettings = GetOptionalProperty(client, "SecuredSettings2")
+            ?? GetOptionalProperty(client, "SecuredSettings");
+        if (securedSettings is not null)
+        {
+            SetOptionalProperty(securedSettings, "KeyboardHookMode", 1);
+        }
+
+        object? advancedSettings = GetOptionalProperty(client, "AdvancedSettings9")
+            ?? GetOptionalProperty(client, "AdvancedSettings8")
+            ?? GetOptionalProperty(client, "AdvancedSettings7")
+            ?? GetOptionalProperty(client, "AdvancedSettings6")
+            ?? GetOptionalProperty(client, "AdvancedSettings");
         if (advancedSettings is not null)
         {
             SetOptionalProperty(advancedSettings, "SmartSizing", true);

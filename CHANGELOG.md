@@ -6,6 +6,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-01
+
+### Changed
+
+- **Simplificação da Barra de Ações (UI Cleanup):** Remoção completa da barra horizontal de ferramentas de ações (`ToolStrip`: Novo, Abrir, Salvar, Grupo, Servidor, Editar, Remover, Conectar, Desconectar), centralizando toda a navegação e operações no `MenuStrip` principal para maior área útil de visualização de conexões e sessões.
+
+### Added
+
+- **Modo Tela Cheia (F11 / Esc):** Implementação de visualização imersiva em tela cheia acessível via menu `Exibir > Tela cheia` ou atalho `F11`. No modo ativo, `MenuStrip` e `StatusStrip` são ocultados e a janela expande para os limites do monitor sem bordas. Retorno transparente suportado via `ESC`, `F11` ou menu.
+- **Gerenciamento e Persistência de Tema:** Adicionado menu `Exibir > Tema` com opções `Claro`, `Escuro` e `Usar tema do Windows` (com sincronização em tempo real via eventos `WM_SETTINGCHANGE` e chave `AppsUseLightTheme`). A escolha é salva em `%LOCALAPPDATA%\PRDC\settings.json`.
+- **Tema Visual Abrangente em Controles e Diálogos:** Suporte a temas claro/escuro com integração ao DWM Immersive Dark Mode do Windows, estilização customizada de `MenuStrip`, `StatusStrip`, `TreeView`, `TabControl` (`_workspaceTabs` e `_sessionTabs` via owner-draw) e todos os diálogos do PRDC (`AboutDialog`, `NodeDialog`, `GuacamoleLoginDialog`).
+- **Preservação de Subsistemas Nativos:** Isolamento estrito de componentes de renderização nativa de sessões, garantindo funcionamento inalterado do Apache Guacamole (WebView2) e do cliente RDP ActiveX (`mstscax.dll`).
+
+## [1.2.1] - 2026-11-01
+
+### Fixed
+
+- **Resolução Dinâmica do Cliente ActiveX RDP (mstscax.dll):** Correção crítica de incompatibilidade em Windows 10, Windows Server 2016/2019/2022 e Windows 11 LTSC que causava a exceção COM `0x80040111 (CLASS_E_CLASSNOTAVAILABLE)` ao tentar abrir sessões RDP nativas.
+- **Mecanismo de Fallback em Cascata:** Implementada detecção automática e seleção dinâmica da versão mais recente suportada pelo sistema operacional local (MsRdpClient11 -> MsRdpClient10 -> MsRdpClient9 -> MsRdpClient8 -> MsRdpClient7 -> MsRdpClient6).
+- **Retrocompatibilidade de Configurações Avançadas:** Mapeamento progressivo de propriedades de teclado e tela (`SecuredSettings2`/`SecuredSettings`, `AdvancedSettings9` até `AdvancedSettings6`) garantindo integridade de parâmetros em clientes legados.
+- **Tratamento Defensivo contra Erros de Registro COM:** Captura graciosa de `0x80040111 (CLASS_E_CLASSNOTAVAILABLE)` e `0x80040154 (CLASS_NOT_REGISTERED)` com orientações amigáveis ao usuário, impedindo o encerramento inesperado do PRDC e mantendo ativas as sessões Apache Guacamole e ferramentas de workspace.
+
 ## [1.2.0] - 2026-10-30
 
 ### Added

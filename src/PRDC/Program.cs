@@ -6,7 +6,7 @@ static class Program
     static void Main()
     {
         ApplicationConfiguration.Initialize();
-        Application.SetColorMode(SystemColorMode.System);
+        ThemeManager.Initialize();
         Application.Run(new MainForm());
     }
 }

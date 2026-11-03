@@ -94,6 +94,7 @@ internal sealed class AboutDialog : Form
         Controls.Add(layout);
         AcceptButton = closeButton;
         CancelButton = closeButton;
+        ThemeManager.ApplyTheme(this);
     }
 
     private static void OpenUrl(string url)
