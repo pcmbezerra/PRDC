@@ -9,7 +9,8 @@ internal sealed record GuacamoleConnectionReference
         string dataSource,
         string connectionIdentifier,
         string displayName,
-        string protocol)
+        string protocol,
+        Guid? portalId = null)
     {
         ArgumentNullException.ThrowIfNull(baseUri);
         if (!baseUri.IsAbsoluteUri
@@ -30,6 +31,7 @@ internal sealed record GuacamoleConnectionReference
         ConnectionIdentifier = connectionIdentifier.Trim();
         DisplayName = displayName.Trim();
         Protocol = protocol.Trim();
+        PortalId = portalId;
     }
 
     public Uri BaseUri { get; }
@@ -41,6 +43,8 @@ internal sealed record GuacamoleConnectionReference
     public string DisplayName { get; }
 
     public string Protocol { get; }
+
+    public Guid? PortalId { get; init; }
 
     public string EncodeClientIdentifier()
     {

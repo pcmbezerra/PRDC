@@ -6,6 +6,53 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [1.4.0-RC1] - 2026-11-06
+
+### Added
+
+- **RFC-004 — Workspace Multiorigem & Persistente:**
+  - Contrato de abstração `IConnectionSource` para gestão desacoplada de origens documentais.
+  - Suporte concorrente a múltiplos arquivos `.rdg` (`RdgFileSource`), com salvamento individual (`Ctrl+S`), salvamento global (`Ctrl+Shift+S`) e fechamento isolado de origens.
+  - Suporte a múltiplos portais Apache Guacamole (`GuacamoleInventorySource`) com diretórios de cache locais isolados (`%LOCALAPPDATA%\PRDC\Portals\{portalId}\`).
+  - Persistência atômica de workspace em `%LOCALAPPDATA%\PRDC\workspace.json` preservando origens abertas, layout, limites de janela e estado de expansão da árvore.
+  - Pipeline de recuperação tolerante a falhas com quarentena automática de workspaces corrompidos (`workspace.json.corrupt.*`) e fallback seguro para modo somente-leitura em esquemas futuros.
+  - Vínculo imutável de contexto de execução por sessão (`SessionContext`) garantindo roteamento transparente para o host correto (`RdpClientHost` ou `GuacamoleSessionHost`).
+  - Gerenciador compartilhado de instâncias WebView2 (`WebView2EnvironmentPool`) com isolamento por portal e reuso eficiente de processos do Microsoft Edge.
+
+- **RFC-005 — Favoritos Globais:**
+  - Camada de acesso rápido unificada através do nó raiz `★ Favoritos` no topo da árvore de conexões.
+  - Mecanismo de resolução resiliente em dois níveis (`ServerLocator`): primário (por `NodePath` ou `ConnectionIdentifier`) e secundário/heurístico (por correspondência de `HostName` e `DisplayName`).
+  - Suporte a apelidos personalizados (`CustomAlias`) preservados de forma independente do nome do servidor de origem (`F2` / `FavoriteAliasDialog`).
+  - Tratamento visual e funcional de conexões órfãs (`FavoriteOrphanStatus`), detectando automaticamente origens ausentes ou servidores excluídos sem quebrar a árvore.
+  - Atalhos de teclado dedicados: `Ctrl+D` (alternar favorito), `F2` (renomear/definir apelido), `Ctrl+G` (navegar até o nó de origem).
+
+- **RFC-006 — Busca Global / Quick Open (`Ctrl+P`):**
+  - Motor de busca instantâneo em memória (`SearchCatalogManager`) capaz de indexar e consultar mais de 20.000 servidores em menos de 3 ms.
+  - Algoritmo de ranqueamento determinístico ponderado por correspondência de prefixo, termos múltiplos (ex.: `sql prod`), correspondência em grupo/caminho, com bônus de relevância para servidores favoritados.
+  - Interface visual flutuante sem bordas (`QuickOpenOverlayForm`) acionada globalmente por `Ctrl+P`.
+  - Navegação fluida por teclado (`Setas`, `Enter` para conexão imediata, `Ctrl+Enter` para foco e seleção na árvore, `Esc` para fechar).
+  - Suporte total aos temas Claro e Escuro da aplicação.
+
+### Changed
+
+- Migração da arquitetura de documento único para Workspace Multiorigem.
+- Otimização do carregamento da árvore (`PopulateTree`) com redução de tempo de renderização de 1.098 ms para 17 ms em 10.000 servidores.
+- Atualização da versão do produto para `1.4.0-rc1` com suporte a compilação self-contained single-file.
+
+### Fixed
+
+- **Reentrância de Redimensionamento de Abas (`UpdateSessionTabSizes`):** Correção de ciclo recursivo no redimensionamento de `_sessionTabs` com adição de trava reentrante (`_updatingSessionTabSizes`) e substituição de alocações gráficas GDI por medição estática via `TextRenderer.MeasureText`.
+- **Compatibilidade ActiveX RDP (mstscax.dll):** Estabilização do fallback em cascata dinâmico de versões de cliente RDP COM em ambientes legados e virtualizados.
+
+### Performance
+
+- **Warm Startup:** 118.75 ms (< 250 ms SLA).
+- **Cold Startup:** 120.76 ms (< 1500 ms SLA).
+- **PopulateTree (10k nós):** 17.27 ms (melhoria de 98,4% sobre a baseline v1.2.2).
+- **Busca Global em 20k nós:** 2.12 ms (< 5 ms SLA).
+- **Abertura do Quick Open:** 1.63 ms (< 30 ms SLA).
+- **Total de Testes Aprovados:** 488/488 (100% de aprovação sem falhas).
+
 ## [1.2.2] - 2026-11-01
 
 ### Changed

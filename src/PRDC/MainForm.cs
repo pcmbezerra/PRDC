@@ -60,12 +60,16 @@ internal sealed class MainForm : Form
     private readonly ToolStripStatusLabel _statusLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
     private readonly ToolStripMenuItem _saveMenuItem = new("&Salvar");
     private readonly ToolStripMenuItem _saveAsMenuItem = new("Salvar &como...");
+    private readonly ToolStripMenuItem _saveAllMenuItem = new("Salvar &tudo");
+    private readonly ToolStripMenuItem _closeFileMenuItem = new("&Fechar arquivo");
     private readonly ToolStripMenuItem _refreshGuacamoleMenuItem = new("&Atualizar lista do Guacamole");
     private readonly ToolStripMenuItem _removeGuacamoleMenuItem = new("&Remover inventário do Guacamole...");
     private readonly ToolStripMenuItem _addGroupMenuItem = new("Adicionar &grupo...");
     private readonly ToolStripMenuItem _addServerMenuItem = new("Adicionar &servidor...");
     private readonly ToolStripMenuItem _editMenuItem = new("&Editar...");
     private readonly ToolStripMenuItem _removeMenuItem = new("&Remover");
+    private readonly ToolStripMenuItem _toggleFavoriteMenuItem = new("&Adicionar aos Favoritos");
+    private readonly ToolStripMenuItem _goToSourceMenuItem = new("&Ir para a origem");
     private readonly ToolStripMenuItem _connectMenuItem = new("&Conectar");
     private readonly ToolStripMenuItem _reconnectMenuItem = new("&Reconectar");
     private readonly ToolStripMenuItem _disconnectMenuItem = new("&Desconectar");
@@ -110,15 +114,121 @@ internal sealed class MainForm : Form
     };
     private readonly System.Windows.Forms.Timer _autoHideTimer = new() { Interval = 500 };
     private readonly Dictionary<XElement, RdpSession> _sessions = new(ReferenceEqualityComparer.Instance);
-    private readonly Dictionary<XElement, GuacamoleConnectionReference> _guacamoleReferences = new(ReferenceEqualityComparer.Instance);
-    private RdgDocument _document = RdgDocument.CreateNew();
+    private readonly List<IConnectionSource> _sources = [];
+    private IConnectionSource? _activeSource;
+    private int _untitledCounter;
     private SplitContainer? _workspaceSplit;
     private ConnectionPaneMode _connectionPaneMode = ConnectionPaneMode.Visible;
     private int _expandedConnectionPaneWidth = ConnectionPaneWidth;
     private bool _populatingTree;
-    private bool _isGuacamoleInventory;
-    private bool _isGuacamoleInventoryModified;
     private bool _startupInventoryLoadAttempted;
+    private bool _applyingTheme;
+    private readonly System.Windows.Forms.Timer _workspaceSaveDebounceTimer = new() { Interval = 500 };
+    private Guid _currentWorkspaceId = Guid.NewGuid();
+    private bool _isRestoringWorkspace;
+    private bool _isWorkspaceRecoveryMode;
+    private bool _workspaceLoadedFromDisk;
+    private static readonly object FavoritesRootTag = new();
+    private FavoriteManager _favoriteManager = new();
+    private readonly SearchCatalogManager _searchCatalog = new();
+
+    internal FavoriteManager FavoriteManager => _favoriteManager;
+
+    internal SearchCatalogManager SearchCatalog => _searchCatalog;
+
+    internal TreeView ConnectionTree => _tree;
+
+    internal TabControl SessionTabs => _sessionTabs;
+
+    internal IReadOnlyList<IConnectionSource> Sources => _sources;
+
+    internal IConnectionSource? ActiveSource => _activeSource;
+
+    internal IConnectionSource Source => _activeSource ?? (_sources.Count > 0 ? _sources[0] : null!);
+
+    internal void SetSource(IConnectionSource source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ClearSources();
+        RegisterSource(source);
+        _activeSource = source;
+    }
+
+    internal void SetActiveSource(IConnectionSource? source)
+    {
+        if (!ReferenceEquals(_activeSource, source))
+        {
+            _activeSource = source;
+            RequestWorkspaceSave();
+        }
+    }
+
+    private void RegisterSource(IConnectionSource source)
+    {
+        _sources.Add(source);
+        source.DirtyChanged += OnSourceDirtyChanged;
+        _searchCatalog.IndexSource(source, _favoriteManager);
+        RequestWorkspaceSave();
+    }
+
+    private void UnregisterSource(IConnectionSource source)
+    {
+        source.DirtyChanged -= OnSourceDirtyChanged;
+        _sources.Remove(source);
+        _searchCatalog.RemoveSource(source.Id);
+        RequestWorkspaceSave();
+    }
+
+    private void ClearSources()
+    {
+        foreach (IConnectionSource s in _sources)
+        {
+            s.DirtyChanged -= OnSourceDirtyChanged;
+            s.Dispose();
+        }
+        _sources.Clear();
+        _searchCatalog.Clear();
+    }
+
+    internal void RegisterOrReplaceGuacamoleSource(GuacamoleInventorySource guacSource)
+    {
+        ArgumentNullException.ThrowIfNull(guacSource);
+
+        GuacamoleInventorySource? existingGuac = _sources.OfType<GuacamoleInventorySource>()
+            .FirstOrDefault(s => s.Id == guacSource.Id || string.Equals(s.DisplayName, guacSource.DisplayName, StringComparison.OrdinalIgnoreCase));
+        if (existingGuac is not null)
+        {
+            CloseSessionsForSource(existingGuac.Id);
+            UnregisterSource(existingGuac);
+            existingGuac.Dispose();
+        }
+        else if (_sources.Count == 1
+            && _sources[0] is RdgFileSource initial
+            && initial.Document.FilePath is null
+            && !initial.IsDirty
+            && initial.Roots.All(r => r.Children.Count == 0)
+            && _sessions.Count == 0)
+        {
+            ClearSources();
+        }
+
+        RegisterSource(guacSource);
+        _activeSource = guacSource;
+
+        PopulateTree();
+        UpdateTitle();
+        UpdateCommands();
+    }
+
+    private void OnSourceDirtyChanged(object? sender, EventArgs e)
+    {
+        if (sender is IConnectionSource source)
+        {
+            UpdateSourceNodeText(source);
+        }
+        UpdateTitle();
+        UpdateCommands();
+    }
 
     public MainForm()
     {
@@ -128,9 +238,17 @@ internal sealed class MainForm : Form
         MinimumSize = new Size(900, 600);
         Size = new Size(1200, 760);
 
+        _untitledCounter = 1;
+        RdgFileSource initialSource = RdgFileSource.CreateNew($"Sem título {_untitledCounter}");
+        RegisterSource(initialSource);
+        _activeSource = initialSource;
+
         MainMenuStrip = BuildMenu();
         Controls.Add(BuildWorkspace());
         _workspaceSplit!.Panel2MinSize = 300;
+        _workspaceSplit.SplitterMoved += (_, _) => RequestWorkspaceSave();
+        _workspaceSaveDebounceTimer.Tick += (_, _) => SaveCurrentWorkspace();
+        ResizeEnd += (_, _) => RequestWorkspaceSave();
         Controls.Add(MainMenuStrip);
         _statusStrip.Items.Add(_statusLabel);
         Controls.Add(_statusStrip);
@@ -140,6 +258,13 @@ internal sealed class MainForm : Form
         _tree.AfterExpand += (_, eventArgs) => UpdateExpanded(eventArgs.Node, true);
         _tree.AfterCollapse += (_, eventArgs) => UpdateExpanded(eventArgs.Node, false);
         _tree.NodeMouseDoubleClick += (_, _) => ActivateSelectedNode();
+        _tree.NodeMouseClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                _tree.SelectedNode = e.Node;
+            }
+        };
         _tree.ContextMenuStrip = BuildContextMenu();
         _thumbnailTimer.Tick += (_, _) => UpdateThumbnails();
         _workspaceTabs.DrawMode = TabDrawMode.OwnerDrawFixed;
@@ -155,6 +280,14 @@ internal sealed class MainForm : Form
         {
             _tree.Invalidate();
             InvalidateSessionTabHeaders();
+            if (_sessionTabs.SelectedTab?.Tag is RdpSession currentSession && currentSession.Context is not null)
+            {
+                IConnectionSource? sessionSource = _sources.FirstOrDefault(s => s.Id == currentSession.Context.SourceId);
+                if (sessionSource is not null)
+                {
+                    _activeSource = sessionSource;
+                }
+            }
             UpdateSelection();
             UpdateCommands();
         };
@@ -170,6 +303,7 @@ internal sealed class MainForm : Form
         SizeChanged += (_, _) => ClampConnectionPaneWidth();
         FormClosing += OnFormClosing;
         FormClosed += OnFormClosed;
+        InitializeWorkspace();
         PopulateTree();
         UpdateTitle();
         SetStatus("Pronto.");
@@ -192,6 +326,9 @@ internal sealed class MainForm : Form
         _saveMenuItem.Click += (_, _) => SaveDocument();
         _saveMenuItem.ShortcutKeys = Keys.Control | Keys.S;
         _saveAsMenuItem.Click += (_, _) => SaveDocumentAs();
+        _saveAllMenuItem.Click += (_, _) => SaveAllDocuments();
+        _saveAllMenuItem.ShortcutKeys = Keys.Control | Keys.Shift | Keys.S;
+        _closeFileMenuItem.Click += (_, _) => CloseSelectedSource();
 
         ToolStripMenuItem loginGuacamoleItem = new("&Login no Guacamole...", null, (_, _) => LoginGuacamoleAsync())
         {
@@ -210,6 +347,8 @@ internal sealed class MainForm : Form
             openItem,
             _saveMenuItem,
             _saveAsMenuItem,
+            _saveAllMenuItem,
+            _closeFileMenuItem,
             new ToolStripSeparator(),
             loginGuacamoleItem,
             _refreshGuacamoleMenuItem,
@@ -228,9 +367,25 @@ internal sealed class MainForm : Form
         _editMenuItem.ShortcutKeys = Keys.Alt | Keys.Enter;
         _removeMenuItem.Click += (_, _) => RemoveSelectedNode();
         _removeMenuItem.ShortcutKeys = Keys.Delete;
+        _toggleFavoriteMenuItem.Click += (_, _) => ToggleFavoriteForSelectedNode();
+        _toggleFavoriteMenuItem.ShortcutKeys = Keys.Control | Keys.D;
+        _goToSourceMenuItem.Click += (_, _) =>
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav)
+            {
+                GoToFavoriteSource(fav);
+            }
+        };
+
+        ToolStripMenuItem quickOpenItem = new("&Busca rápida... (Quick Open)");
+        quickOpenItem.ShortcutKeys = Keys.Control | Keys.P;
+        quickOpenItem.Click += (_, _) => OpenQuickOpen();
+
         edit.DropDownItems.AddRange([
             _addGroupMenuItem, _addServerMenuItem, new ToolStripSeparator(),
-            _editMenuItem, _removeMenuItem
+            _editMenuItem, _removeMenuItem, new ToolStripSeparator(),
+            _toggleFavoriteMenuItem, _goToSourceMenuItem, new ToolStripSeparator(),
+            quickOpenItem
         ]);
         edit.DropDownOpening += (_, _) => UpdateCommands();
 
@@ -345,51 +500,152 @@ internal sealed class MainForm : Form
     private ContextMenuStrip BuildContextMenu()
     {
         ContextMenuStrip menu = new();
+
+        // 1. Itens para Nó Raiz ★ Favoritos
+        ToolStripItem favExpandAll = menu.Items.Add("Expandir favoritos", null, (_, _) => FindFavoritesRootNode()?.ExpandAll());
+        ToolStripItem favCollapseAll = menu.Items.Add("Recolher favoritos", null, (_, _) => FindFavoritesRootNode()?.Collapse());
+        ToolStripSeparator favRootSep = new();
+        menu.Items.Add(favRootSep);
+        ToolStripItem favCleanOrphans = menu.Items.Add("Remover favoritos órfãos...", null, (_, _) => CleanOrphanFavorites());
+
+        // 2. Itens para Nó de Favorito Individual
+        ToolStripItem favConnect = menu.Items.Add("Conectar", null, (_, _) =>
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav) _ = ConnectFavoriteAsync(fav);
+        });
+        ToolStripItem favGoToSource = menu.Items.Add("Ir para a origem (Ctrl+G)", null, (_, _) =>
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav) GoToFavoriteSource(fav);
+        });
+        ToolStripSeparator favSep1 = new();
+        menu.Items.Add(favSep1);
+        ToolStripItem favRename = menu.Items.Add("Renomear favorito... (F2)", null, (_, _) =>
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav) RenameFavoritePrompt(fav);
+        });
+        ToolStripItem favMoveUp = menu.Items.Add("Mover para cima", null, (_, _) =>
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav) MoveFavoriteUp(fav);
+        });
+        ToolStripItem favMoveDown = menu.Items.Add("Mover para baixo", null, (_, _) =>
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav) MoveFavoriteDown(fav);
+        });
+        ToolStripSeparator favSep2 = new();
+        menu.Items.Add(favSep2);
+        ToolStripItem favRemove = menu.Items.Add("Remover dos Favoritos (Del)", null, (_, _) =>
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav) RemoveFavoriteNode(fav);
+        });
+
+        // 3. Itens Regulares da Árvore RDG / Guacamole
         ToolStripItem connect = menu.Items.Add("Conectar", null, (_, _) => ConnectSelectedServer());
         ToolStripItem disconnect = menu.Items.Add("Desconectar", null, (_, _) => DisconnectSession());
-        menu.Items.Add(new ToolStripSeparator());
+        ToolStripSeparator regSep1 = new();
+        menu.Items.Add(regSep1);
+        ToolStripItem toggleFavRegular = menu.Items.Add("Adicionar aos Favoritos (Ctrl+D)", null, (_, _) => ToggleFavoriteForSelectedNode());
+        ToolStripSeparator regSepFav = new();
+        menu.Items.Add(regSepFav);
         ToolStripItem addGroup = menu.Items.Add("Adicionar grupo...", null, (_, _) => AddGroup());
         ToolStripItem addServer = menu.Items.Add("Adicionar servidor...", null, (_, _) => AddServer());
-        menu.Items.Add(new ToolStripSeparator());
+        ToolStripSeparator regSep2 = new();
+        menu.Items.Add(regSep2);
         ToolStripItem edit = menu.Items.Add("Editar...", null, (_, _) => EditSelectedNode());
         ToolStripItem remove = menu.Items.Add("Remover", null, (_, _) => RemoveSelectedNode());
+        ToolStripSeparator fileSeparator = new();
+        menu.Items.Add(fileSeparator);
+        ToolStripItem closeFile = menu.Items.Add("Fechar arquivo", null, (_, _) => CloseSelectedSource());
+        ToolStripSeparator guacSeparator = new();
+        menu.Items.Add(guacSeparator);
+        ToolStripItem refreshGuac = menu.Items.Add("Atualizar portal...", null, (_, _) => RefreshGuacamoleAsync());
+        ToolStripItem removeGuac = menu.Items.Add("Remover portal...", null, (_, _) => RemoveGuacamoleInventory());
+
         menu.Opening += (_, _) =>
         {
             UpdateCommands();
+
+            bool isFavRoot = ReferenceEquals(_tree.SelectedNode?.Tag, FavoritesRootTag);
+            FavoriteEntry? fav = _tree.SelectedNode?.Tag as FavoriteEntry;
+            bool isFavItem = fav is not null;
+            bool isRegularNode = !isFavRoot && !isFavItem;
+
+            // Raiz ★ Favoritos
+            favExpandAll.Visible = isFavRoot;
+            favCollapseAll.Visible = isFavRoot;
+            favRootSep.Visible = isFavRoot;
+            favCleanOrphans.Visible = isFavRoot;
+            favCleanOrphans.Enabled = isFavRoot && _favoriteManager.DetectOrphanFavorites(_sources).Count > 0;
+
+            // Item de Favorito
+            favConnect.Visible = isFavItem;
+            favConnect.Enabled = isFavItem && _favoriteManager.ResolveFavorite(fav!, _sources).IsValid;
+            favGoToSource.Visible = isFavItem;
+            favGoToSource.Enabled = isFavItem && _favoriteManager.ResolveFavorite(fav!, _sources).IsValid;
+            favSep1.Visible = isFavItem;
+            favRename.Visible = isFavItem;
+            favMoveUp.Visible = isFavItem;
+            favMoveUp.Enabled = isFavItem && fav!.OrderIndex > 0;
+            favMoveDown.Visible = isFavItem;
+            favMoveDown.Enabled = isFavItem && fav!.OrderIndex < _favoriteManager.Favorites.Count - 1;
+            favSep2.Visible = isFavItem;
+            favRemove.Visible = isFavItem;
+
+            // Itens Regulares
+            connect.Visible = isRegularNode;
             connect.Enabled = _connectMenuItem.Enabled;
+            disconnect.Visible = isRegularNode;
             disconnect.Enabled = _disconnectMenuItem.Enabled;
+            regSep1.Visible = isRegularNode;
+
+            bool isServer = isRegularNode && SelectedNode?.Kind == RdgNodeKind.Server;
+            toggleFavRegular.Visible = isServer;
+            regSepFav.Visible = isServer;
+            if (isServer)
+            {
+                bool isFav = IsServerFavorited(SelectedNode);
+                toggleFavRegular.Text = isFav ? "Remover dos Favoritos (Ctrl+D)" : "Adicionar aos Favoritos (Ctrl+D)";
+            }
+
+            addGroup.Visible = isRegularNode;
             addGroup.Enabled = _addGroupMenuItem.Enabled;
+            addServer.Visible = isRegularNode;
             addServer.Enabled = _addServerMenuItem.Enabled;
+            regSep2.Visible = isRegularNode;
+            edit.Visible = isRegularNode;
             edit.Enabled = _editMenuItem.Enabled;
+            remove.Visible = isRegularNode;
             remove.Enabled = _removeMenuItem.Enabled;
+
+            bool isFile = isRegularNode && SelectedNode?.Kind == RdgNodeKind.File;
+            closeFile.Visible = isFile;
+            closeFile.Enabled = isFile;
+            fileSeparator.Visible = isFile;
+
+            bool isGuacSource = isRegularNode && SelectedNode is not null && GetSourceForNode(SelectedNode) is GuacamoleInventorySource;
+            refreshGuac.Visible = isGuacSource;
+            refreshGuac.Enabled = isGuacSource;
+            removeGuac.Visible = isGuacSource;
+            removeGuac.Enabled = isGuacSource;
+            guacSeparator.Visible = isGuacSource;
         };
         return menu;
     }
 
-    private void NewDocument()
+    internal void NewDocument()
     {
-        if (!ConfirmCloseSessions() || !ConfirmDiscardChanges())
-        {
-            return;
-        }
-
-        _document = RdgDocument.CreateNew();
-        _guacamoleReferences.Clear();
-        _isGuacamoleInventory = false;
-        _isGuacamoleInventoryModified = false;
+        _untitledCounter++;
+        RdgFileSource newSource = RdgFileSource.CreateNew($"Sem título {_untitledCounter}");
+        RegisterSource(newSource);
+        _activeSource = newSource;
         PopulateTree();
+        SelectSourceRootNode(newSource);
         UpdateTitle();
         UpdateCommands();
-        SetStatus("Novo arquivo RDG criado.");
+        SetStatus($"Novo arquivo RDG criado: {newSource.DisplayName}");
     }
 
     private void OpenDocument()
     {
-        if (!ConfirmCloseSessions() || !ConfirmDiscardChanges())
-        {
-            return;
-        }
-
         using OpenFileDialog dialog = new()
         {
             Filter = "RDCMan Groups (*.rdg)|*.rdg|Arquivos XML (*.xml)|*.xml|Todos os arquivos (*.*)|*.*",
@@ -400,20 +656,65 @@ internal sealed class MainForm : Form
             return;
         }
 
+        OpenDocument(dialog.FileName);
+    }
+
+    internal IConnectionSource? OpenDocument(string filePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+
         try
         {
-            _document = RdgDocument.Load(dialog.FileName);
-            _guacamoleReferences.Clear();
-            _isGuacamoleInventory = false;
-            _isGuacamoleInventoryModified = false;
+            string fullPath = Path.GetFullPath(filePath);
+
+            IConnectionSource? existing = _sources.FirstOrDefault(s =>
+                s is RdgFileSource rdg && string.Equals(rdg.Document.FilePath, fullPath, StringComparison.OrdinalIgnoreCase));
+
+            if (existing is not null)
+            {
+                _activeSource = existing;
+                SelectSourceRootNode(existing);
+                SetStatus($"Arquivo já aberto: {existing.DisplayName}");
+                return existing;
+            }
+
+            if (_sources.Count == 1
+                && _sources[0] is RdgFileSource singleRdg
+                && singleRdg.Document.FilePath is null
+                && !singleRdg.IsDirty
+                && singleRdg.Roots.All(r => r.Children.Count == 0)
+                && _sessions.Count == 0)
+            {
+                ClearSources();
+            }
+            else
+            {
+                RdgFileSource? emptyUntitled = _sources.OfType<RdgFileSource>().FirstOrDefault(s =>
+                    s.Document.FilePath is null && !s.IsDirty && s.Roots.All(r => r.Children.Count == 0));
+                if (emptyUntitled is not null
+                    && _sources.Count(s => s is RdgFileSource) == 1
+                    && _sessions.Values.All(sess => sess.Context?.SourceId != emptyUntitled.Id))
+                {
+                    UnregisterSource(emptyUntitled);
+                    emptyUntitled.Dispose();
+                }
+            }
+
+            RdgFileSource newSource = RdgFileSource.Load(fullPath);
+            RegisterSource(newSource);
+            _activeSource = newSource;
+
             PopulateTree();
+            SelectSourceRootNode(newSource);
             UpdateTitle();
             UpdateCommands();
-            SetStatus($"Aberto: {dialog.FileName}");
+            SetStatus($"Aberto: {fullPath}");
+            return newSource;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or XmlException or InvalidDataException)
         {
             MessageBox.Show(this, exception.Message, "Erro ao abrir RDG", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return null;
         }
     }
 
@@ -425,83 +726,94 @@ internal sealed class MainForm : Form
 
     private async Task LoadCachedGuacamoleInventoryAsync()
     {
-        if (_startupInventoryLoadAttempted)
+        if (_startupInventoryLoadAttempted || _workspaceLoadedFromDisk)
         {
             return;
         }
 
         _startupInventoryLoadAttempted = true;
 
-        if (!GuacamoleInventoryCache.Exists())
+        await GuacamolePortalManager.MigrateLegacyCacheIfNecessaryAsync();
+
+        IReadOnlyList<GuacamolePortalMetadata> portals = GuacamolePortalManager.ListPortals();
+        if (portals.Count == 0 && !GuacamoleInventoryCache.Exists())
         {
             SetStatus("Pronto.");
             return;
         }
 
-        GuacamoleCacheLoadResult loadResult;
-        try
-        {
-            loadResult = await GuacamoleInventoryCache.LoadAsync();
-        }
-        catch (Exception ex)
-        {
-            SetStatus($"Falha ao carregar o inventário do Guacamole: {ex.Message}");
-            return;
-        }
+        int loadedPortals = 0;
+        int totalServers = 0;
+        int totalGroups = 0;
 
-        if (loadResult.IsSuccess && loadResult.CacheRoot is not null)
+        if (portals.Count > 0)
         {
+            foreach (GuacamolePortalMetadata portal in portals)
+            {
+                try
+                {
+                    string inventoryPath = GuacamolePortalManager.GetInventoryFilePath(portal.Id);
+                    GuacamoleCacheLoadResult loadResult = await GuacamoleInventoryCache.LoadAsync(inventoryPath);
+                    if (loadResult.IsSuccess && loadResult.CacheRoot is not null)
+                    {
+                        GuacamoleImportResult materialized = GuacamoleInventoryCache.Materialize(loadResult.CacheRoot);
+                        GuacamoleInventorySource guacSource = GuacamoleInventorySource.FromImportResult(
+                            materialized,
+                            portal.Id,
+                            portal.DisplayName);
+                        RegisterOrReplaceGuacamoleSource(guacSource);
+
+                        loadedPortals++;
+                        totalServers += materialized.ServerCount;
+                        totalGroups += materialized.GroupCount;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SetStatus($"Erro ao carregar portal Guacamole '{portal.DisplayName}': {ex.Message}");
+                }
+            }
+
+            if (loadedPortals > 0)
+            {
+                SetStatus($"Inventário Guacamole carregado: {loadedPortals} portal(is), {totalServers} servidor(es) em {totalGroups} grupo(s).");
+                return;
+            }
+        }
+        else
+        {
+            GuacamoleCacheLoadResult loadResult;
             try
             {
-                GuacamoleImportResult materialized = GuacamoleInventoryCache.Materialize(loadResult.CacheRoot);
-                _document = materialized.Document;
-                _guacamoleReferences.Clear();
-                foreach ((XElement element, GuacamoleConnectionReference reference) in materialized.ConnectionReferences)
-                {
-                    _guacamoleReferences[element] = reference;
-                }
-
-                _isGuacamoleInventory = true;
-                _isGuacamoleInventoryModified = false;
-                PopulateTree();
-                UpdateTitle();
-                UpdateCommands();
-
-                string lastUpdate = loadResult.CacheRoot.SavedAtUtc.ToLocalTime().ToString("dd/MM/yyyy HH:mm");
-                SetStatus($"Inventário Guacamole carregado: {materialized.ServerCount} servidor(es) em {materialized.GroupCount} grupo(s). Última atualização: {lastUpdate}.");
+                loadResult = await GuacamoleInventoryCache.LoadAsync();
             }
             catch (Exception ex)
             {
-                SetStatus($"Erro ao materializar o inventário do Guacamole: {ex.Message}");
+                SetStatus($"Falha ao carregar o inventário do Guacamole: {ex.Message}");
+                return;
             }
 
-            return;
+            if (loadResult.IsSuccess && loadResult.CacheRoot is not null)
+            {
+                try
+                {
+                    GuacamoleImportResult materialized = GuacamoleInventoryCache.Materialize(loadResult.CacheRoot);
+                    GuacamoleInventorySource guacSource = GuacamoleInventorySource.FromImportResult(materialized);
+                    RegisterOrReplaceGuacamoleSource(guacSource);
+
+                    string lastUpdate = loadResult.CacheRoot.SavedAtUtc.ToLocalTime().ToString("dd/MM/yyyy HH:mm");
+                    SetStatus($"Inventário Guacamole carregado: {materialized.ServerCount} servidor(es) em {materialized.GroupCount} grupo(s). Última atualização: {lastUpdate}.");
+                }
+                catch (Exception ex)
+                {
+                    SetStatus($"Erro ao materializar o inventário do Guacamole: {ex.Message}");
+                }
+
+                return;
+            }
         }
 
-        switch (loadResult.FailureKind)
-        {
-            case GuacamoleCacheFailureKind.NotFound:
-                SetStatus("Pronto.");
-                break;
-
-            case GuacamoleCacheFailureKind.Corrupt:
-                SetStatus("O inventário local do Guacamole não pôde ser carregado e foi preservado para diagnóstico. Efetue login novamente para recriá-lo.");
-                break;
-
-            case GuacamoleCacheFailureKind.UnsupportedSchema:
-                SetStatus("O inventário local do Guacamole foi criado por uma versão incompatível do PRDC e não pôde ser carregado.");
-                break;
-
-            case GuacamoleCacheFailureKind.AccessDenied:
-                SetStatus("O PRDC não possui permissão para acessar o inventário local do Guacamole.");
-                break;
-
-            case GuacamoleCacheFailureKind.IoFailure:
-            case GuacamoleCacheFailureKind.ValidationFailed:
-            default:
-                SetStatus("Não foi possível salvar ou carregar o inventário local do Guacamole.");
-                break;
-        }
+        SetStatus("Pronto.");
     }
 
     private async void LoginGuacamoleAsync()
@@ -513,12 +825,20 @@ internal sealed class MainForm : Form
             return;
         }
 
-        await ExecuteGuacamoleImportFlowAsync(dialog.ServerUrl, dialog.UserName, dialog.Password, isRefresh: false);
+        await ExecuteGuacamoleImportFlowAsync(
+            dialog.ServerUrl,
+            dialog.UserName,
+            dialog.Password,
+            isRefresh: false,
+            portalDisplayName: dialog.PortalDisplayName);
     }
 
     private async void RefreshGuacamoleAsync()
     {
-        string? initialUrl = GetActiveGuacamoleBaseUrl();
+        GuacamoleInventorySource? targetSource = GetTargetGuacamoleSource();
+        string? initialUrl = targetSource?.BaseUrl ?? GetActiveGuacamoleBaseUrl();
+        string? initialName = targetSource?.DisplayName;
+
         if (initialUrl is null && GuacamoleInventoryCache.Exists())
         {
             try
@@ -535,28 +855,39 @@ internal sealed class MainForm : Form
             }
         }
 
-        using GuacamoleLoginDialog dialog = new(initialUrl ?? string.Empty);
+        using GuacamoleLoginDialog dialog = new(initialUrl ?? string.Empty, initialName);
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
             SetStatus("Atualização do Guacamole cancelada.");
             return;
         }
 
-        await ExecuteGuacamoleImportFlowAsync(dialog.ServerUrl, dialog.UserName, dialog.Password, isRefresh: true);
+        await ExecuteGuacamoleImportFlowAsync(
+            dialog.ServerUrl,
+            dialog.UserName,
+            dialog.Password,
+            isRefresh: true,
+            portalDisplayName: dialog.PortalDisplayName,
+            targetPortalId: targetSource?.Id);
     }
 
     private async Task ExecuteGuacamoleImportFlowAsync(
         string serverUrl,
         string username,
         string password,
-        bool isRefresh)
+        bool isRefresh,
+        string? portalDisplayName = null,
+        Guid? targetPortalId = null)
     {
         string operationName = isRefresh ? "Atualização do Guacamole" : "Login no Guacamole";
+        Guid portalId = targetPortalId ?? Guid.NewGuid();
+        string displayName = string.IsNullOrWhiteSpace(portalDisplayName) ? "Guacamole" : portalDisplayName.Trim();
+
         GuacamoleImportResult result;
         UseWaitCursor = true;
         SetStatus(isRefresh
-            ? "Atualizando inventário do Guacamole..."
-            : "Autenticando no Guacamole e carregando o inventário...");
+            ? $"Atualizando portal Guacamole '{displayName}'..."
+            : $"Autenticando no portal '{displayName}' e carregando o inventário...");
 
         try
         {
@@ -629,13 +960,48 @@ internal sealed class MainForm : Form
             return;
         }
 
-        if (!ConfirmCloseSessions() || !ConfirmDiscardChanges())
+        GuacamoleInventorySource? existingGuac = _sources.OfType<GuacamoleInventorySource>().FirstOrDefault(s => s.Id == portalId);
+        if (existingGuac is not null)
         {
-            SetStatus($"{operationName} cancelado.");
-            return;
+            List<RdpSession> guacSessions = _sessions.Values
+                .Where(s => s.Context?.SourceId == existingGuac.Id)
+                .ToList();
+
+            if (guacSessions.Any(IsSessionActive))
+            {
+                DialogResult sessionConfirm = MessageBox.Show(
+                    this,
+                    $"Existem sessões ativas do portal '{existingGuac.DisplayName}' que serão encerradas para {operationName.ToLowerInvariant()}. Deseja continuar?",
+                    "Atualizar inventário do Guacamole",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+
+                if (sessionConfirm != DialogResult.Yes)
+                {
+                    SetStatus($"{operationName} cancelado.");
+                    return;
+                }
+            }
+
+            if (existingGuac.IsDirty)
+            {
+                DialogResult discardConfirm = MessageBox.Show(
+                    this,
+                    $"O inventário do portal '{existingGuac.DisplayName}' possui modificações não salvas que serão descartadas. Deseja continuar?",
+                    "Modificações não salvas no Guacamole",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+
+                if (discardConfirm != DialogResult.Yes)
+                {
+                    SetStatus($"{operationName} cancelado.");
+                    return;
+                }
+            }
         }
 
-        GuacamoleCacheSaveResult saveResult = await GuacamoleInventoryCache.SaveAsync(cacheRoot);
+        GuacamolePortalMetadata metadata = new(portalId, displayName, serverUrl, DateTime.UtcNow);
+        GuacamoleCacheSaveResult saveResult = await GuacamolePortalManager.SavePortalAsync(metadata, cacheRoot);
         if (!saveResult.IsSuccess)
         {
             string errorMessage = saveResult.FailureKind switch
@@ -658,132 +1024,373 @@ internal sealed class MainForm : Form
             return;
         }
 
-        _document = result.Document;
-        _guacamoleReferences.Clear();
-        foreach ((XElement element, GuacamoleConnectionReference reference) in result.ConnectionReferences)
-        {
-            _guacamoleReferences[element] = reference;
-        }
-
-        _isGuacamoleInventory = true;
-        _isGuacamoleInventoryModified = false;
-
-        PopulateTree();
-        UpdateTitle();
-        UpdateCommands();
+        GuacamoleInventorySource guacSource = GuacamoleInventorySource.FromImportResult(result, portalId, displayName);
+        RegisterOrReplaceGuacamoleSource(guacSource);
 
         if (isRefresh)
         {
-            SetStatus($"Lista do Guacamole atualizada: {result.ServerCount} servidor(es) RDP em {result.GroupCount} grupo(s).");
+            SetStatus($"Portal '{displayName}' atualizado: {result.ServerCount} servidor(es) RDP em {result.GroupCount} grupo(s).");
         }
         else
         {
-            SetStatus($"Login concluído. Importados {result.ServerCount} servidor(es) RDP em {result.GroupCount} grupo(s) do Guacamole. Cache local salvo.");
+            SetStatus($"Login concluído no portal '{displayName}'. Importados {result.ServerCount} servidor(es) RDP em {result.GroupCount} grupo(s). Cache local salvo.");
         }
     }
 
-    private void RemoveGuacamoleInventory()
+    internal void RemoveGuacamoleInventory(bool promptUser = true)
     {
-        DialogResult confirm = MessageBox.Show(
-            this,
-            "Deseja remover o inventário local do Guacamole deste computador? As conexões precisarão ser importadas novamente.",
-            "Remover inventário do Guacamole",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Question);
-
-        if (confirm != DialogResult.Yes)
+        GuacamoleInventorySource? guacSource = GetTargetGuacamoleSource();
+        if (guacSource is null && GuacamolePortalManager.ListPortals().Count == 0 && !GuacamoleInventoryCache.Exists())
         {
+            SetStatus("Nenhum inventário do Guacamole carregado.");
             return;
         }
 
-        if (!ConfirmCloseSessions() || !ConfirmDiscardChanges())
+        string portalName = guacSource?.DisplayName ?? "Guacamole";
+        Guid? portalId = guacSource?.Id;
+
+        if (promptUser)
         {
-            return;
+            DialogResult confirm = MessageBox.Show(
+                this,
+                $"Deseja remover o portal Guacamole '{portalName}' deste computador? As conexões precisarão ser importadas novamente.",
+                "Remover portal do Guacamole",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+        }
+
+        if (guacSource is not null)
+        {
+            List<RdpSession> guacSessions = _sessions.Values
+                .Where(s => s.Context?.SourceId == guacSource.Id)
+                .ToList();
+
+            if (promptUser && guacSessions.Any(IsSessionActive))
+            {
+                DialogResult sessionConfirm = MessageBox.Show(
+                    this,
+                    $"Existem sessões do portal '{portalName}' ativas que serão encerradas. Deseja continuar?",
+                    "Fechar sessões do Guacamole",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+
+                if (sessionConfirm != DialogResult.Yes)
+                {
+                    return;
+                }
+            }
+
+            CloseSessionsForSource(guacSource.Id);
+            UnregisterSource(guacSource);
+            guacSource.Dispose();
+
+            if (_sources.Count == 0)
+            {
+                _untitledCounter++;
+                RdgFileSource initial = RdgFileSource.CreateNew($"Sem título {_untitledCounter}");
+                RegisterSource(initial);
+                _activeSource = initial;
+            }
+            else if (ReferenceEquals(_activeSource, guacSource))
+            {
+                _activeSource = _sources[0];
+            }
         }
 
         try
         {
-            GuacamoleInventoryCache.Delete();
+            if (portalId.HasValue)
+            {
+                GuacamolePortalManager.DeletePortal(portalId.Value);
+            }
+            else
+            {
+                GuacamoleInventoryCache.Delete();
+            }
         }
         catch (Exception ex)
         {
-            MessageBox.Show(
-                this,
-                $"Não foi possível excluir o cache do Guacamole: {ex.Message}",
-                "Erro ao remover inventário",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-            return;
+            if (promptUser)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Não foi possível excluir o cache do portal Guacamole: {ex.Message}",
+                    "Remover portal do Guacamole",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
         }
-
-        if (GuacamoleInventoryCache.Exists())
-        {
-            MessageBox.Show(
-                this,
-                "O arquivo de cache do Guacamole não pôde ser removido (pode estar em uso por outro processo).",
-                "Erro ao remover inventário",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-            return;
-        }
-
-        _guacamoleReferences.Clear();
-        _document = RdgDocument.CreateNew();
-        _isGuacamoleInventory = false;
-        _isGuacamoleInventoryModified = false;
 
         PopulateTree();
         UpdateTitle();
         UpdateCommands();
-        SetStatus("Inventário local do Guacamole removido.");
+        SetStatus($"Portal Guacamole '{portalName}' removido.");
+    }
+
+    private GuacamoleInventorySource? GetTargetGuacamoleSource()
+    {
+        return (_activeSource as GuacamoleInventorySource)
+            ?? (GetSourceForNode(SelectedNode) as GuacamoleInventorySource)
+            ?? _sources.OfType<GuacamoleInventorySource>().FirstOrDefault();
     }
 
     private string? GetActiveGuacamoleBaseUrl()
     {
-        if (_guacamoleReferences.Count > 0)
+        return GetTargetGuacamoleSource()?.BaseUrl;
+    }
+
+    internal bool SaveDocument()
+    {
+        IConnectionSource? targetSource = _activeSource ?? GetSourceForNode(SelectedNode) ?? _sources.FirstOrDefault();
+        if (targetSource is null)
         {
-            return _guacamoleReferences.Values.FirstOrDefault()?.BaseUri.AbsoluteUri;
+            return false;
         }
 
-        return null;
+        if (targetSource.IsReadOnly)
+        {
+            MessageBox.Show(this, "Esta origem é somente leitura e não pode ser salva.", "Salvar", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        return targetSource.Document.FilePath is null ? SaveSourceAs(targetSource) : SaveSourceTo(targetSource, targetSource.Document.FilePath);
     }
 
-    private bool SaveDocument()
+    internal bool SaveDocumentAs()
     {
-        return _document.FilePath is null ? SaveDocumentAs() : SaveTo(_document.FilePath);
+        IConnectionSource? targetSource = _activeSource ?? GetSourceForNode(SelectedNode) ?? _sources.FirstOrDefault();
+        if (targetSource is null)
+        {
+            return false;
+        }
+
+        if (targetSource.IsReadOnly)
+        {
+            MessageBox.Show(this, "Esta origem é somente leitura e não pode ser salva.", "Salvar como", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        return SaveSourceAs(targetSource);
     }
 
-    private bool SaveDocumentAs()
+    private bool SaveSourceAs(IConnectionSource targetSource)
     {
+        string defaultName = targetSource.Document.FilePath is null
+            ? (targetSource.Kind == ConnectionSourceKind.GuacamoleInventory ? "Guacamole.rdg" : $"{targetSource.DisplayName}.rdg")
+            : Path.GetFileName(targetSource.Document.FilePath);
+
         using SaveFileDialog dialog = new()
         {
             Filter = "RDCMan Groups (*.rdg)|*.rdg|Arquivos XML (*.xml)|*.xml",
             DefaultExt = "rdg",
             AddExtension = true,
-            Title = "Salvar arquivo RDG",
-            FileName = _document.FilePath is null
-                ? (_isGuacamoleInventory ? "Guacamole.rdg" : "PRDC.rdg")
-                : Path.GetFileName(_document.FilePath)
+            Title = $"Salvar '{targetSource.DisplayName}' como...",
+            FileName = defaultName
         };
 
-        return dialog.ShowDialog(this) == DialogResult.OK && SaveTo(dialog.FileName);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return false;
+        }
+
+        return SaveSourceTo(targetSource, dialog.FileName);
     }
 
-    private bool SaveTo(string filePath)
+    private bool SaveSourceTo(IConnectionSource targetSource, string filePath)
     {
         try
         {
-            _document.Save(filePath);
-            _isGuacamoleInventoryModified = false;
+            targetSource.SaveAs(filePath);
+            UpdateSourceNodeText(targetSource);
+            UpdateSessionTitles();
             UpdateTitle();
             UpdateCommands();
             SetStatus($"Salvo: {filePath}");
+            RequestWorkspaceSave();
             return true;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             MessageBox.Show(this, exception.Message, "Erro ao salvar RDG", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
+        }
+    }
+
+    internal bool SaveAllDocuments()
+    {
+        List<string> errors = [];
+        int savedCount = 0;
+
+        foreach (IConnectionSource source in _sources.Where(s => s.IsDirty && !s.IsReadOnly).ToList())
+        {
+            try
+            {
+                if (source.Document.FilePath is null)
+                {
+                    if (SaveSourceAs(source))
+                    {
+                        savedCount++;
+                    }
+                }
+                else
+                {
+                    source.Save();
+                    UpdateSourceNodeText(source);
+                    savedCount++;
+                }
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"{source.DisplayName}: {ex.Message}");
+            }
+        }
+
+        UpdateTitle();
+        UpdateCommands();
+
+        if (errors.Count > 0)
+        {
+            MessageBox.Show(this, "Erros ao salvar alguns arquivos:\n" + string.Join("\n", errors), "Salvar tudo", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        if (savedCount > 0)
+        {
+            SetStatus($"Salvo(s) {savedCount} arquivo(s).");
+        }
+
+        return true;
+    }
+
+    internal bool CloseSelectedSource()
+    {
+        IConnectionSource? source = GetSourceForNode(SelectedNode) ?? _activeSource;
+        if (source is null)
+        {
+            return false;
+        }
+
+        return CloseSource(source);
+    }
+
+    internal bool CloseSource(IConnectionSource source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+
+        if (!_sources.Contains(source))
+        {
+            return false;
+        }
+
+        if (source.IsDirty)
+        {
+            DialogResult result = MessageBox.Show(
+                this,
+                $"Salvar as alterações em '{source.DisplayName}' antes de fechar?",
+                "PRDC",
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Question);
+
+            if (result == DialogResult.Cancel)
+            {
+                return false;
+            }
+
+            if (result == DialogResult.Yes)
+            {
+                if (source.Document.FilePath is null)
+                {
+                    if (!SaveSourceAs(source))
+                    {
+                        return false;
+                    }
+                }
+                else
+                {
+                    source.Save();
+                }
+            }
+        }
+
+        CloseSessionsForSource(source.Id);
+
+        UnregisterSource(source);
+        source.Dispose();
+
+        if (_sources.Count == 0)
+        {
+            _untitledCounter++;
+            RdgFileSource initial = RdgFileSource.CreateNew($"Sem título {_untitledCounter}");
+            RegisterSource(initial);
+            _activeSource = initial;
+        }
+        else if (ReferenceEquals(_activeSource, source))
+        {
+            _activeSource = _sources[0];
+        }
+
+        PopulateTree();
+        UpdateTitle();
+        UpdateCommands();
+        SetStatus($"Arquivo fechado: {source.DisplayName}");
+        return true;
+    }
+
+    internal IConnectionSource? GetSourceForNode(RdgNode? node)
+    {
+        if (node is null)
+        {
+            return null;
+        }
+
+        XDocument? doc = node.Element.Document;
+        if (doc is not null)
+        {
+            foreach (IConnectionSource source in _sources)
+            {
+                if (source.Roots.Count > 0 && source.Roots[0].Element.Document == doc)
+                {
+                    return source;
+                }
+            }
+        }
+
+        XElement current = node.Element;
+        while (current.Parent is not null && current.Parent.Name.LocalName != "RDCMan")
+        {
+            current = current.Parent;
+        }
+
+        return _sources.FirstOrDefault(s => s.Roots.Any(r => ReferenceEquals(r.Element, current)));
+    }
+
+    private void SelectSourceRootNode(IConnectionSource source)
+    {
+        foreach (TreeNode node in _tree.Nodes)
+        {
+            if (node.Tag is RdgNode rdgNode && source.Roots.Any(r => ReferenceEquals(r.Element, rdgNode.Element)))
+            {
+                _tree.SelectedNode = node;
+                node.EnsureVisible();
+                break;
+            }
+        }
+    }
+
+    private void UpdateSourceNodeText(IConnectionSource source)
+    {
+        foreach (TreeNode treeNode in _tree.Nodes)
+        {
+            if (treeNode.Tag is RdgNode node && node.Kind == RdgNodeKind.File && source.Roots.Any(r => ReferenceEquals(r.Element, node.Element)))
+            {
+                treeNode.Text = GetTreeNodeText(node);
+                break;
+            }
         }
     }
 
@@ -795,15 +1402,21 @@ internal sealed class MainForm : Form
             return;
         }
 
+        IConnectionSource? source = GetSourceForNode(parent);
+        if (source is null)
+        {
+            return;
+        }
+
         using NodeDialog dialog = new(RdgNodeKind.Group, "Novo grupo");
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
             return;
         }
 
-        RdgNode created = _document.AddGroup(parent, dialog.NodeName);
+        RdgNode created = source.Document.AddGroup(parent, dialog.NodeName);
         RefreshAndSelect(created.Element);
-        MarkChanged("Grupo adicionado.");
+        MarkChanged(source, "Grupo adicionado.");
     }
 
     private void AddServer()
@@ -814,22 +1427,62 @@ internal sealed class MainForm : Form
             return;
         }
 
+        IConnectionSource? source = GetSourceForNode(parent);
+        if (source is null)
+        {
+            return;
+        }
+
         using NodeDialog dialog = new(RdgNodeKind.Server, "Novo servidor");
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
             return;
         }
 
-        RdgNode created = _document.AddServer(parent, dialog.NodeName, dialog.HostName);
+        RdgNode created = source.Document.AddServer(parent, dialog.NodeName, dialog.HostName);
         RefreshAndSelect(created.Element);
-        MarkChanged("Servidor adicionado.");
+        MarkChanged(source, "Servidor adicionado.");
     }
 
     private void EditSelectedNode()
     {
+        if (_tree.SelectedNode?.Tag is FavoriteEntry fav)
+        {
+            RenameFavoritePrompt(fav);
+            return;
+        }
+
         RdgNode? node = SelectedNode;
         if (node is null)
         {
+            return;
+        }
+
+        IConnectionSource? source = GetSourceForNode(node);
+        if (source is null)
+        {
+            return;
+        }
+
+        if (source is RdgFileSource { IsMissing: true } rdg)
+        {
+            MessageBox.Show(
+                this,
+                $"O arquivo '{rdg.FilePath}' não foi encontrado no disco.",
+                "Arquivo não encontrado",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (source is GuacamoleInventorySource { IsMissing: true } guac)
+        {
+            MessageBox.Show(
+                this,
+                $"O portal Guacamole '{guac.DisplayName}' não foi encontrado no disco.",
+                "Portal não encontrado",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
             return;
         }
 
@@ -841,7 +1494,7 @@ internal sealed class MainForm : Form
 
         if (node.Kind == RdgNodeKind.Server)
         {
-            _document.UpdateServer(node, dialog.NodeName, dialog.HostName);
+            source.Document.UpdateServer(node, dialog.NodeName, dialog.HostName);
             if (_sessions.TryGetValue(node.Element, out RdpSession? session))
             {
                 session.DisplayName = dialog.NodeName;
@@ -850,15 +1503,21 @@ internal sealed class MainForm : Form
         }
         else
         {
-            _document.UpdateGroup(node, dialog.NodeName);
+            source.Document.UpdateGroup(node, dialog.NodeName);
         }
 
         RefreshAndSelect(node.Element);
-        MarkChanged("Item atualizado.");
+        MarkChanged(source, "Item atualizado.");
     }
 
     private void ActivateSelectedNode()
     {
+        if (_tree.SelectedNode?.Tag is FavoriteEntry fav)
+        {
+            _ = ConnectFavoriteAsync(fav);
+            return;
+        }
+
         if (SelectedNode?.Kind == RdgNodeKind.Server)
         {
             ConnectSelectedServer();
@@ -871,6 +1530,12 @@ internal sealed class MainForm : Form
 
     private async void ConnectSelectedServer()
     {
+        if (_tree.SelectedNode?.Tag is FavoriteEntry fav)
+        {
+            await ConnectFavoriteAsync(fav);
+            return;
+        }
+
         await ConnectSelectedServerAsync();
     }
 
@@ -882,7 +1547,8 @@ internal sealed class MainForm : Form
             return;
         }
 
-        bool isGuacamole = _guacamoleReferences.ContainsKey(server.Element);
+        IConnectionSource? source = GetSourceForNode(server);
+        bool isGuacamole = source?.GuacamoleReferences.ContainsKey(server.Element) == true;
         if (!isGuacamole && string.IsNullOrWhiteSpace(server.HostName))
         {
             return;
@@ -1173,8 +1839,11 @@ internal sealed class MainForm : Form
             return;
         }
 
+        bool isFavRoot = ReferenceEquals(eventArgs.Node.Tag, FavoritesRootTag);
+        FavoriteEntry? favEntry = eventArgs.Node.Tag as FavoriteEntry;
         RdgNode? node = eventArgs.Node.Tag as RdgNode;
-        if (node is null)
+
+        if (!isFavRoot && favEntry is null && node is null)
         {
             eventArgs.DrawDefault = true;
             return;
@@ -1184,13 +1853,51 @@ internal sealed class MainForm : Form
         Color backColor = selected ? SystemColors.Highlight : _tree.BackColor;
         Color foreColor = selected ? SystemColors.HighlightText : _tree.ForeColor;
 
-        int textOffset = node.Kind == RdgNodeKind.Server
-            ? 3 + StatusCircleDiameter + StatusCircleSpacing
-            : 2;
+        int textOffset;
+        Color? customCircleColor = null;
+
+        if (isFavRoot)
+        {
+            textOffset = 2;
+        }
+        else if (favEntry is not null)
+        {
+            textOffset = 3 + StatusCircleDiameter + StatusCircleSpacing;
+            var res = _favoriteManager.ResolveFavorite(favEntry, _sources);
+            if (res.IsValid && res.ServerElement is not null)
+            {
+                customCircleColor = GetServerStatusColor(res.ServerElement);
+            }
+            else
+            {
+                customCircleColor = Color.DarkGray;
+                if (!selected)
+                {
+                    foreColor = ThemeManager.IsDark ? Color.DarkGray : SystemColors.GrayText;
+                }
+            }
+        }
+        else
+        {
+            textOffset = node!.Kind == RdgNodeKind.Server
+                ? 3 + StatusCircleDiameter + StatusCircleSpacing
+                : 2;
+        }
+
+        string displayText = isFavRoot
+            ? eventArgs.Node.Text
+            : favEntry is not null
+                ? eventArgs.Node.Text
+                : node!.Name;
+
+        Font drawFont = isFavRoot
+            ? new Font(_tree.Font, FontStyle.Bold)
+            : _tree.Font;
+
         int measuredTextWidth = TextRenderer.MeasureText(
             eventArgs.Graphics,
-            node.Name,
-            _tree.Font,
+            displayText,
+            drawFont,
             Size.Empty,
             TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix).Width;
         int boundsWidth = Math.Max(eventArgs.Bounds.Width, textOffset + measuredTextWidth + 4);
@@ -1201,7 +1908,16 @@ internal sealed class MainForm : Form
             eventArgs.Graphics.FillRectangle(backgroundBrush, nodeBounds);
         }
 
-        if (node.Kind == RdgNodeKind.Server)
+        if (favEntry is not null && customCircleColor.HasValue)
+        {
+            Rectangle circleBounds = new(
+                nodeBounds.Left + 3,
+                nodeBounds.Top + ((nodeBounds.Height - StatusCircleDiameter) / 2),
+                StatusCircleDiameter,
+                StatusCircleDiameter);
+            DrawStatusCircle(eventArgs.Graphics, circleBounds, customCircleColor.Value);
+        }
+        else if (node?.Kind == RdgNodeKind.Server)
         {
             Rectangle circleBounds = new(
                 nodeBounds.Left + 3,
@@ -1218,14 +1934,19 @@ internal sealed class MainForm : Form
             nodeBounds.Bottom);
         TextRenderer.DrawText(
             eventArgs.Graphics,
-            node.Name,
-            _tree.Font,
+            displayText,
+            drawFont,
             textBounds,
             foreColor,
             TextFormatFlags.Left
                 | TextFormatFlags.VerticalCenter
                 | TextFormatFlags.SingleLine
                 | TextFormatFlags.NoPrefix);
+
+        if (isFavRoot)
+        {
+            drawFont.Dispose();
+        }
 
         if ((eventArgs.State & TreeNodeStates.Focused) == TreeNodeStates.Focused)
         {
@@ -1416,6 +2137,12 @@ internal sealed class MainForm : Form
 
     private void RemoveSelectedNode()
     {
+        if (_tree.SelectedNode?.Tag is FavoriteEntry fav)
+        {
+            RemoveFavoriteNode(fav);
+            return;
+        }
+
         RdgNode? node = SelectedNode;
         if (node is null || node.Kind == RdgNodeKind.File)
         {
@@ -1434,11 +2161,18 @@ internal sealed class MainForm : Form
             return;
         }
 
+        IConnectionSource? source = GetSourceForNode(node);
+        if (source is null)
+        {
+            return;
+        }
+
         CloseSessionsFor(node.Element);
         RemoveGuacamoleReferencesFor(node.Element);
-        _document.Remove(node);
+        source.Document.Remove(node);
+        source.MarkModified();
         PopulateTree();
-        MarkChanged("Item removido.");
+        MarkChanged(source, "Item removido.");
     }
 
     private void PopulateTree()
@@ -1448,9 +2182,17 @@ internal sealed class MainForm : Form
         try
         {
             _tree.Nodes.Clear();
-            foreach (RdgNode root in _document.Roots)
+
+            // 1. Nó raiz fixo ★ Favoritos
+            _tree.Nodes.Add(CreateFavoritesRootNode());
+
+            // 2. Fontes de Conexão
+            foreach (IConnectionSource source in _sources)
             {
-                _tree.Nodes.Add(CreateTreeNode(root));
+                foreach (RdgNode root in source.Roots)
+                {
+                    _tree.Nodes.Add(CreateTreeNode(root));
+                }
             }
         }
         finally
@@ -1461,7 +2203,20 @@ internal sealed class MainForm : Form
 
         if (_tree.Nodes.Count > 0)
         {
-            _tree.SelectedNode = _tree.Nodes[0];
+            TreeNode? target = null;
+            if (_activeSource is not null)
+            {
+                foreach (TreeNode node in _tree.Nodes)
+                {
+                    if (node.Tag is RdgNode rdgNode && _activeSource.Roots.Any(r => ReferenceEquals(r.Element, rdgNode.Element)))
+                    {
+                        target = node;
+                        break;
+                    }
+                }
+            }
+
+            _tree.SelectedNode = target ?? (_tree.Nodes.Count > 1 ? _tree.Nodes[1] : _tree.Nodes[0]);
         }
         else
         {
@@ -1469,6 +2224,90 @@ internal sealed class MainForm : Form
         }
 
         AutoResizeConnectionPane();
+    }
+
+    private TreeNode CreateFavoritesRootNode()
+    {
+        TreeNode root = new($"★ Favoritos ({_favoriteManager.Favorites.Count})")
+        {
+            Tag = FavoritesRootTag
+        };
+
+        foreach (FavoriteEntry fav in _favoriteManager.Favorites.OrderBy(f => f.OrderIndex))
+        {
+            root.Nodes.Add(CreateFavoriteTreeNode(fav));
+        }
+
+        if (_favoriteManager.Favorites.Count > 0)
+        {
+            root.Expand();
+        }
+
+        return root;
+    }
+
+    private TreeNode CreateFavoriteTreeNode(FavoriteEntry fav)
+    {
+        var res = _favoriteManager.ResolveFavorite(fav, _sources);
+        string label;
+        if (res.Status == FavoriteOrphanStatus.MissingSource)
+        {
+            label = $"{fav.EffectiveDisplayName} [origem ausente]";
+        }
+        else if (res.Status == FavoriteOrphanStatus.MissingNode)
+        {
+            label = $"{fav.EffectiveDisplayName} [servidor ausente]";
+        }
+        else
+        {
+            string sourceLabel = res.Source?.DisplayName ?? fav.SourceType;
+            label = $"{fav.EffectiveDisplayName} [{sourceLabel}]";
+        }
+
+        return new TreeNode(label)
+        {
+            Tag = fav
+        };
+    }
+
+    internal void PopulateFavoritesRootNode()
+    {
+        if (_populatingTree) return;
+
+        TreeNode? favRoot = FindFavoritesRootNode();
+        if (favRoot is null)
+        {
+            PopulateTree();
+            return;
+        }
+
+        _tree.BeginUpdate();
+        try
+        {
+            favRoot.Text = $"★ Favoritos ({_favoriteManager.Favorites.Count})";
+            favRoot.Nodes.Clear();
+            foreach (FavoriteEntry fav in _favoriteManager.Favorites.OrderBy(f => f.OrderIndex))
+            {
+                favRoot.Nodes.Add(CreateFavoriteTreeNode(fav));
+            }
+
+            if (_favoriteManager.Favorites.Count > 0)
+            {
+                favRoot.Expand();
+            }
+        }
+        finally
+        {
+            _tree.EndUpdate();
+        }
+
+        AutoResizeConnectionPane();
+        _tree.Invalidate();
+    }
+
+    private TreeNode? FindFavoritesRootNode()
+    {
+        return _tree.Nodes.Cast<TreeNode>().FirstOrDefault(n => ReferenceEquals(n.Tag, FavoritesRootTag));
     }
 
     private TreeNode CreateTreeNode(RdgNode node)
@@ -1502,6 +2341,11 @@ internal sealed class MainForm : Form
     {
         foreach (TreeNode treeNode in nodes)
         {
+            if (ReferenceEquals(treeNode.Tag, FavoritesRootTag))
+            {
+                continue;
+            }
+
             if (treeNode.Tag is RdgNode node && ReferenceEquals(node.Element, element))
             {
                 return treeNode;
@@ -1533,13 +2377,95 @@ internal sealed class MainForm : Form
 
     private void UpdateSelection()
     {
+        bool isFavRoot = ReferenceEquals(_tree.SelectedNode?.Tag, FavoritesRootTag);
+        FavoriteEntry? fav = _tree.SelectedNode?.Tag as FavoriteEntry;
+
+        if (isFavRoot)
+        {
+            _nodeTitle.Text = "★ Favoritos";
+            _nodeType.Text = $"{_favoriteManager.Favorites.Count} favoritos cadastrados";
+            _nodeHost.Text = "Acesso rápido e atalhos de conexão direta";
+            _connectionState.Visible = false;
+            _thumbnailTitle.Visible = false;
+            _thumbnail.Visible = false;
+            _thumbnailStatus.Visible = false;
+            UpdateCommands();
+            return;
+        }
+
+        if (fav is not null)
+        {
+            var res = _favoriteManager.ResolveFavorite(fav, _sources);
+            _nodeTitle.Text = fav.EffectiveDisplayName;
+
+            if (res.IsValid && res.ServerElement is not null && res.Source is not null)
+            {
+                _activeSource = res.Source;
+                string sourceLabel = res.Source.DisplayName;
+                _nodeType.Text = $"Favorito ({fav.SourceType}) | Origem: {sourceLabel}";
+                _nodeHost.Text = $"Host: {fav.Locator.HostName ?? fav.Locator.OriginalDisplayName}";
+
+                RdgNode fakeNode = RdgNode.Create(res.ServerElement) ?? new RdgNode(res.ServerElement, RdgNodeKind.Server);
+                RdpConnectionState state = GetConnectionState(fakeNode);
+                RdpSession? session = GetSession(fakeNode);
+                bool isServer = true;
+                _connectionState.Visible = isServer;
+                _connectionState.Text = $"Estado: {GetConnectionStateText(state)}";
+                _thumbnailTitle.Visible = isServer;
+                _thumbnail.Visible = isServer;
+                _thumbnailStatus.Visible = isServer;
+
+                bool isGuac = res.Source.GuacamoleReferences.ContainsKey(res.ServerElement);
+                if (isGuac)
+                {
+                    _thumbnailTitle.Text = $"Miniatura da sessão - {fav.EffectiveDisplayName}";
+                    _thumbnail.Image = null;
+                    _thumbnailStatus.Text = "Sessão web via Apache Guacamole.";
+                }
+                else
+                {
+                    _thumbnailTitle.Text = session?.RdpHost is not null
+                        ? $"Miniatura da sessão - {session.RdpHost.Server}"
+                        : "Miniatura da sessão";
+                    _thumbnail.Image = session?.Thumbnail;
+                    _thumbnailStatus.Text = state switch
+                    {
+                        RdpConnectionState.Connecting => "Aguardando a conexão para gerar a miniatura.",
+                        RdpConnectionState.Connected or RdpConnectionState.LoggedIn when session?.Thumbnail is null => "Capturando a sessão remota...",
+                        RdpConnectionState.Connected or RdpConnectionState.LoggedIn => "Atualizada automaticamente a cada segundo.",
+                        _ => "Sem sessão ativa."
+                    };
+                }
+            }
+            else
+            {
+                string reason = res.Status switch
+                {
+                    FavoriteOrphanStatus.MissingSource => "Origem não carregada no workspace",
+                    FavoriteOrphanStatus.MissingNode => "Servidor não encontrado na origem",
+                    _ => res.FailureReason ?? "Indisponível"
+                };
+                _nodeType.Text = $"Favorito Órfão ({res.Status})";
+                _nodeHost.Text = reason;
+                _connectionState.Visible = false;
+                _thumbnailTitle.Visible = false;
+                _thumbnail.Visible = false;
+                _thumbnailStatus.Visible = false;
+            }
+
+            UpdateCommands();
+            return;
+        }
+
         RdgNode? node = SelectedNode;
+        _activeSource = GetSourceForNode(node) ?? _activeSource ?? _sources.FirstOrDefault();
         _nodeTitle.Text = node?.Name ?? "Nenhum item selecionado";
-        bool isServer = node?.Kind == RdgNodeKind.Server;
-        GuacamoleConnectionReference? guacamoleReference = isServer
-            && _guacamoleReferences.TryGetValue(node!.Element, out GuacamoleConnectionReference? foundRef)
-                ? foundRef
-                : null;
+        bool isServerNode = node?.Kind == RdgNodeKind.Server;
+        GuacamoleConnectionReference? guacamoleReference = null;
+        if (isServerNode && _activeSource is not null && _activeSource.GuacamoleReferences.TryGetValue(node!.Element, out GuacamoleConnectionReference? foundRef))
+        {
+            guacamoleReference = foundRef;
+        }
 
         if (guacamoleReference is not null)
         {
@@ -1556,16 +2482,16 @@ internal sealed class MainForm : Form
                 RdgNodeKind.Server => "Servidor",
                 _ => string.Empty
             };
-            _nodeHost.Text = isServer ? $"Host: {node!.HostName}" : string.Empty;
+            _nodeHost.Text = isServerNode ? $"Host: {node!.HostName}" : string.Empty;
         }
 
-        RdpConnectionState state = isServer ? GetConnectionState(node!) : RdpConnectionState.Disconnected;
-        RdpSession? session = isServer ? GetSession(node!) : null;
-        _connectionState.Visible = isServer;
-        _connectionState.Text = isServer ? $"Estado: {GetConnectionStateText(state)}" : string.Empty;
-        _thumbnailTitle.Visible = isServer;
-        _thumbnail.Visible = isServer;
-        _thumbnailStatus.Visible = isServer;
+        RdpConnectionState nodeState = isServerNode ? GetConnectionState(node!) : RdpConnectionState.Disconnected;
+        RdpSession? nodeSession = isServerNode ? GetSession(node!) : null;
+        _connectionState.Visible = isServerNode;
+        _connectionState.Text = isServerNode ? $"Estado: {GetConnectionStateText(nodeState)}" : string.Empty;
+        _thumbnailTitle.Visible = isServerNode;
+        _thumbnail.Visible = isServerNode;
+        _thumbnailStatus.Visible = isServerNode;
 
         if (guacamoleReference is not null)
         {
@@ -1575,15 +2501,15 @@ internal sealed class MainForm : Form
         }
         else
         {
-            _thumbnailTitle.Text = session?.RdpHost is not null
-                ? $"Miniatura da sessão - {session.RdpHost.Server}"
+            _thumbnailTitle.Text = nodeSession?.RdpHost is not null
+                ? $"Miniatura da sessão - {nodeSession.RdpHost.Server}"
                 : "Miniatura da sessão";
-            _thumbnail.Image = session?.Thumbnail;
-            _thumbnailStatus.Text = isServer
-                ? state switch
+            _thumbnail.Image = nodeSession?.Thumbnail;
+            _thumbnailStatus.Text = isServerNode
+                ? nodeState switch
                 {
                     RdpConnectionState.Connecting => "Aguardando a conexão para gerar a miniatura.",
-                    RdpConnectionState.Connected or RdpConnectionState.LoggedIn when session?.Thumbnail is null =>
+                    RdpConnectionState.Connected or RdpConnectionState.LoggedIn when nodeSession?.Thumbnail is null =>
                         "Capturando a sessão remota...",
                     RdpConnectionState.Connected or RdpConnectionState.LoggedIn => "Atualizada automaticamente a cada segundo.",
                     _ => "Sem sessão ativa."
@@ -1596,15 +2522,65 @@ internal sealed class MainForm : Form
 
     private void UpdateCommands()
     {
+        bool isFavRoot = ReferenceEquals(_tree.SelectedNode?.Tag, FavoritesRootTag);
+        FavoriteEntry? fav = _tree.SelectedNode?.Tag as FavoriteEntry;
         RdgNode? selected = SelectedNode;
-        bool container = GetContainerNode() is not null;
-        _addGroupMenuItem.Enabled = container;
-        _addServerMenuItem.Enabled = container;
-        _editMenuItem.Enabled = selected is not null;
-        _removeMenuItem.Enabled = selected is { Kind: not RdgNodeKind.File };
-        RdpSession? selectedSession = selected?.Kind == RdgNodeKind.Server ? GetSession(selected) : null;
-        _connectMenuItem.Enabled = selected?.Kind == RdgNodeKind.Server
-            && (selectedSession is null || !IsSessionActive(selectedSession));
+
+        if (isFavRoot)
+        {
+            _addGroupMenuItem.Enabled = false;
+            _addServerMenuItem.Enabled = false;
+            _editMenuItem.Enabled = false;
+            _removeMenuItem.Enabled = false;
+            _connectMenuItem.Enabled = false;
+            _toggleFavoriteMenuItem.Enabled = false;
+            _goToSourceMenuItem.Enabled = false;
+        }
+        else if (fav is not null)
+        {
+            var res = _favoriteManager.ResolveFavorite(fav, _sources);
+            _addGroupMenuItem.Enabled = false;
+            _addServerMenuItem.Enabled = false;
+            _editMenuItem.Enabled = true;
+            _removeMenuItem.Enabled = true;
+            _toggleFavoriteMenuItem.Text = "&Remover dos Favoritos";
+            _toggleFavoriteMenuItem.Enabled = true;
+            _goToSourceMenuItem.Enabled = res.IsValid;
+            _goToSourceMenuItem.Visible = true;
+
+            bool canConnect = res.IsValid && res.ServerElement is not null;
+            if (canConnect)
+            {
+                RdgNode fakeNode = RdgNode.Create(res.ServerElement!) ?? new RdgNode(res.ServerElement!, RdgNodeKind.Server);
+                RdpSession? s = GetSession(fakeNode);
+                _connectMenuItem.Enabled = s is null || !IsSessionActive(s);
+            }
+            else
+            {
+                _connectMenuItem.Enabled = false;
+            }
+        }
+        else
+        {
+            bool container = GetContainerNode() is not null;
+            _addGroupMenuItem.Enabled = container;
+            _addServerMenuItem.Enabled = container;
+            _editMenuItem.Enabled = selected is not null;
+            _removeMenuItem.Enabled = selected is { Kind: not RdgNodeKind.File };
+
+            RdpSession? selectedSession = selected?.Kind == RdgNodeKind.Server ? GetSession(selected) : null;
+            _connectMenuItem.Enabled = selected?.Kind == RdgNodeKind.Server
+                && (selectedSession is null || !IsSessionActive(selectedSession));
+
+            bool isServer = selected?.Kind == RdgNodeKind.Server;
+            _toggleFavoriteMenuItem.Enabled = isServer;
+            _toggleFavoriteMenuItem.Text = isServer && IsServerFavorited(selected)
+                ? "&Remover dos Favoritos"
+                : "&Adicionar aos Favoritos";
+            _goToSourceMenuItem.Enabled = false;
+            _goToSourceMenuItem.Visible = false;
+        }
+
         RdpSession? commandSession = GetCommandSession();
         _reconnectMenuItem.Enabled = commandSession is not null && CanReconnectSession(commandSession);
         _disconnectMenuItem.Enabled = commandSession is not null && IsSessionActive(commandSession);
@@ -1615,27 +2591,33 @@ internal sealed class MainForm : Form
             IsLogOffPending: false
         };
         _closeSessionTabMenuItem.Enabled = _sessionTabs.SelectedTab?.Tag is RdpSession;
-        _saveMenuItem.Enabled = true;
-        _saveAsMenuItem.Enabled = true;
-        _refreshGuacamoleMenuItem.Enabled = GuacamoleInventoryCache.Exists()
-            || (_isGuacamoleInventory && GetActiveGuacamoleBaseUrl() is not null);
-        _removeGuacamoleMenuItem.Enabled = GuacamoleInventoryCache.Exists() || _isGuacamoleInventory;
+        _saveMenuItem.Enabled = _activeSource is not null && !_activeSource.IsReadOnly;
+        _saveAsMenuItem.Enabled = _activeSource is not null && !_activeSource.IsReadOnly;
+        _saveAllMenuItem.Enabled = _sources.Any(s => s.IsDirty && !s.IsReadOnly);
+        _closeFileMenuItem.Enabled = _activeSource is not null;
+        bool hasGuacamole = _sources.Any(s => s.Kind == ConnectionSourceKind.GuacamoleInventory)
+            || GuacamolePortalManager.ListPortals().Count > 0
+            || GuacamoleInventoryCache.Exists();
+        _refreshGuacamoleMenuItem.Enabled = hasGuacamole;
+        _removeGuacamoleMenuItem.Enabled = hasGuacamole;
     }
 
     private void UpdateExpanded(TreeNode? treeNode, bool expanded)
     {
         if (!_populatingTree && treeNode?.Tag is RdgNode node)
         {
-            _document.SetExpanded(node, expanded);
+            IConnectionSource? source = GetSourceForNode(node);
+            source?.Document.SetExpanded(node, expanded);
+            if (source is not null)
+            {
+                UpdateSourceNodeText(source);
+            }
             UpdateTitle();
             AutoResizeConnectionPane();
         }
     }
 
-    private bool HasUnsavedChanges =>
-        _isGuacamoleInventory
-            ? _isGuacamoleInventoryModified
-            : _document.IsDirty;
+    private bool HasUnsavedChanges => _sources.Any(s => s.IsDirty);
 
     private bool ConfirmDiscardChanges()
     {
@@ -1644,16 +2626,21 @@ internal sealed class MainForm : Form
             return true;
         }
 
+        int dirtyCount = _sources.Count(s => s.IsDirty);
+        string message = dirtyCount == 1
+            ? $"O arquivo '{_sources.First(s => s.IsDirty).DisplayName}' possui alterações não salvas.\nDeseja salvar antes de continuar?"
+            : $"Existem {dirtyCount} arquivos com alterações não salvas.\nDeseja salvar todas as alterações antes de continuar?";
+
         DialogResult result = MessageBox.Show(
             this,
-            "Salvar as alterações antes de continuar?",
+            message,
             "PRDC",
             MessageBoxButtons.YesNoCancel,
             MessageBoxIcon.Question);
 
         return result switch
         {
-            DialogResult.Yes => SaveDocument(),
+            DialogResult.Yes => SaveAllDocuments(),
             DialogResult.No => true,
             _ => false
         };
@@ -1692,6 +2679,8 @@ internal sealed class MainForm : Form
         }
 
         DisconnectAllSessions();
+        _workspaceSaveDebounceTimer.Stop();
+        SaveCurrentWorkspace();
     }
 
     private void OnFormClosed(object? sender, FormClosedEventArgs eventArgs)
@@ -1699,7 +2688,9 @@ internal sealed class MainForm : Form
         ThemeManager.ThemeChanged -= ApplyCurrentTheme;
         _thumbnailTimer.Dispose();
         _autoHideTimer.Dispose();
+        _workspaceSaveDebounceTimer.Dispose();
         CloseAllSessions();
+        ClearSources();
     }
 
     public bool IsFullScreen => _isFullScreen;
@@ -1783,6 +2774,12 @@ internal sealed class MainForm : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        if (keyData == (Keys.Control | Keys.P))
+        {
+            OpenQuickOpen();
+            return true;
+        }
+
         if (keyData == Keys.F11)
         {
             ToggleFullScreen();
@@ -1795,7 +2792,453 @@ internal sealed class MainForm : Form
             return true;
         }
 
+        if (keyData == (Keys.Control | Keys.D))
+        {
+            ToggleFavoriteForSelectedNode();
+            return true;
+        }
+
+        if (keyData == (Keys.Control | Keys.G))
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav)
+            {
+                GoToFavoriteSource(fav);
+                return true;
+            }
+        }
+
+        if (keyData == Keys.F2)
+        {
+            if (_tree.SelectedNode?.Tag is FavoriteEntry fav)
+            {
+                RenameFavoritePrompt(fav);
+                return true;
+            }
+            else if (SelectedNode is not null)
+            {
+                EditSelectedNode();
+                return true;
+            }
+        }
+
+        if (keyData == Keys.Delete && _tree.SelectedNode?.Tag is FavoriteEntry favDelete)
+        {
+            RemoveFavoriteNode(favDelete);
+            return true;
+        }
+
+        if (keyData == Keys.Enter && _tree.Focused)
+        {
+            ActivateSelectedNode();
+            return true;
+        }
+
+        if (keyData == (Keys.Control | Keys.P))
+        {
+            OpenQuickOpen();
+            return true;
+        }
+
         return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    private bool IsServerFavorited(RdgNode? server)
+    {
+        if (server?.Kind != RdgNodeKind.Server) return false;
+        IConnectionSource? source = GetSourceForNode(server);
+        if (source is null) return false;
+
+        string nodePath = ServerLocator.BuildNodePath(server.Element);
+        return _favoriteManager.Favorites.Any(f =>
+            f.SourceId == source.Id && (f.Locator.NodePath == nodePath || f.OriginalDisplayName == server.Name));
+    }
+
+    internal void ToggleFavoriteForSelectedNode()
+    {
+        if (_tree.SelectedNode?.Tag is FavoriteEntry fav)
+        {
+            RemoveFavoriteNode(fav);
+            return;
+        }
+
+        RdgNode? server = SelectedNode;
+        if (server?.Kind != RdgNodeKind.Server)
+        {
+            SetStatus("Selecione um servidor para adicionar aos favoritos.");
+            return;
+        }
+
+        IConnectionSource? source = GetSourceForNode(server);
+        if (source is null)
+        {
+            return;
+        }
+
+        string nodePath = ServerLocator.BuildNodePath(server.Element);
+        FavoriteEntry? existing = _favoriteManager.Favorites
+            .FirstOrDefault(f => f.SourceId == source.Id && (f.Locator.NodePath == nodePath || f.OriginalDisplayName == server.Name));
+
+        if (existing is not null)
+        {
+            RemoveFavoriteNode(existing);
+        }
+        else
+        {
+            FavoriteEntry added = _favoriteManager.AddFavorite(source, server.Element);
+            _searchCatalog.UpdateFavorite(added, isRemoved: false);
+            PopulateFavoritesRootNode();
+            RequestWorkspaceSave();
+            SetStatus($"'{added.EffectiveDisplayName}' adicionado aos favoritos.");
+        }
+    }
+
+    internal void RemoveFavoriteNode(FavoriteEntry fav)
+    {
+        if (_favoriteManager.RemoveFavorite(fav.FavoriteId))
+        {
+            _searchCatalog.UpdateFavorite(fav, isRemoved: true);
+            PopulateFavoritesRootNode();
+            RequestWorkspaceSave();
+            SetStatus($"Favorito '{fav.EffectiveDisplayName}' removido.");
+        }
+    }
+
+    internal bool GoToFavoriteSource(FavoriteEntry fav)
+    {
+        var res = _favoriteManager.ResolveFavorite(fav, _sources);
+        if (!res.IsValid || res.ServerElement is null)
+        {
+            string reason = res.Status switch
+            {
+                FavoriteOrphanStatus.MissingSource => "origem não carregada",
+                FavoriteOrphanStatus.MissingNode => "servidor não encontrado na origem",
+                _ => res.FailureReason ?? "servidor indisponível"
+            };
+            SetStatus($"Não foi possível ir para a origem: {reason}.");
+            return false;
+        }
+
+        TreeNode? target = FindTreeNode(_tree.Nodes, res.ServerElement);
+        if (target is not null)
+        {
+            _tree.SelectedNode = target;
+            target.EnsureVisible();
+            SetStatus($"Localizado na origem: {res.Source?.DisplayName}");
+            return true;
+        }
+
+        SetStatus("Nó de origem não encontrado na árvore.");
+        return false;
+    }
+
+    internal void RenameFavoritePrompt(FavoriteEntry fav)
+    {
+        using FavoriteAliasDialog dialog = new(fav.OriginalDisplayName, fav.CustomAlias);
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            _favoriteManager.RenameFavorite(fav.FavoriteId, dialog.AliasText);
+            _searchCatalog.UpdateFavorite(fav, isRemoved: false);
+            PopulateFavoritesRootNode();
+            UpdateSelection();
+            RequestWorkspaceSave();
+            SetStatus($"Favorito atualizado para '{fav.EffectiveDisplayName}'.");
+        }
+    }
+
+    internal void MoveFavoriteUp(FavoriteEntry fav)
+    {
+        if (fav.OrderIndex > 0)
+        {
+            _favoriteManager.ReorderFavorite(fav.FavoriteId, fav.OrderIndex - 1);
+            PopulateFavoritesRootNode();
+            RequestWorkspaceSave();
+            SelectFavoriteNode(fav.FavoriteId);
+        }
+    }
+
+    internal void MoveFavoriteDown(FavoriteEntry fav)
+    {
+        if (fav.OrderIndex < _favoriteManager.Favorites.Count - 1)
+        {
+            _favoriteManager.ReorderFavorite(fav.FavoriteId, fav.OrderIndex + 1);
+            PopulateFavoritesRootNode();
+            RequestWorkspaceSave();
+            SelectFavoriteNode(fav.FavoriteId);
+        }
+    }
+
+    private void SelectFavoriteNode(Guid favoriteId)
+    {
+        TreeNode? favRoot = FindFavoritesRootNode();
+        if (favRoot is not null)
+        {
+            foreach (TreeNode child in favRoot.Nodes)
+            {
+                if (child.Tag is FavoriteEntry f && f.FavoriteId == favoriteId)
+                {
+                    _tree.SelectedNode = child;
+                    child.EnsureVisible();
+                    break;
+                }
+            }
+        }
+    }
+
+    internal void CleanOrphanFavorites()
+    {
+        var orphans = _favoriteManager.DetectOrphanFavorites(_sources);
+        if (orphans.Count == 0)
+        {
+            SetStatus("Nenhum favorito órfão encontrado.");
+            return;
+        }
+
+        DialogResult dr = MessageBox.Show(
+            this,
+            $"Foram encontrados {orphans.Count} favoritos com origem ou servidor ausente.\nDeseja remover esses favoritos da lista?",
+            "Limpar Favoritos Órfãos",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+
+        if (dr == DialogResult.Yes)
+        {
+            foreach (var o in orphans)
+            {
+                _favoriteManager.RemoveFavorite(o.Favorite.FavoriteId);
+                _searchCatalog.UpdateFavorite(o.Favorite, isRemoved: true);
+            }
+            PopulateFavoritesRootNode();
+            RequestWorkspaceSave();
+            SetStatus($"{orphans.Count} favoritos órfãos removidos.");
+        }
+    }
+
+    internal async Task<RdpSession?> ConnectFavoriteAsync(FavoriteEntry favorite, bool startHostConnection = true, bool showPromptOnError = true)
+    {
+        var res = _favoriteManager.ResolveFavorite(favorite, _sources);
+        if (!res.IsValid || res.Source is null || res.ServerElement is null)
+        {
+            string reason = res.Status switch
+            {
+                FavoriteOrphanStatus.MissingSource => "a origem correspondente não está carregada no workspace",
+                FavoriteOrphanStatus.MissingNode => "o servidor não foi encontrado na origem",
+                _ => res.FailureReason ?? "o servidor não pôde ser resolvido"
+            };
+            if (showPromptOnError)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Não foi possível conectar ao favorito '{favorite.EffectiveDisplayName}': {reason}.",
+                    "Favorito indisponível",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            SetStatus($"Favorito '{favorite.EffectiveDisplayName}' indisponível: {reason}.");
+            return null;
+        }
+
+        RdgNode serverNode = RdgNode.Create(res.ServerElement)
+            ?? new RdgNode(res.ServerElement, RdgNodeKind.Server);
+
+        _activeSource = res.Source;
+
+        try
+        {
+            _workspaceTabs.SelectedTab = _sessionPage;
+            RdpSession session = GetOrCreateSession(serverNode);
+            _sessionTabs.SelectedTab = session.Page;
+            UpdateConnectionViews();
+
+            if (IsSessionActive(session))
+            {
+                SetStatus($"A sessão de {favorite.EffectiveDisplayName} já está ativa.");
+                return session;
+            }
+
+            if (startHostConnection)
+            {
+                if (session.Kind == SessionKind.GuacamoleWeb)
+                {
+                    UpdateCommands();
+                    await session.GuacamoleHost!.ConnectAsync();
+                }
+                else
+                {
+                    session.RdpHost!.ConnectTo(serverNode.HostName);
+                }
+            }
+
+            UpdateCommands();
+            return session;
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException
+                or System.Runtime.InteropServices.COMException
+                or System.Runtime.InteropServices.InvalidComObjectException
+                or TargetInvocationException)
+        {
+            if (IsDisposed || Disposing) return null;
+            bool isGuacamole = res.Source.GuacamoleReferences.ContainsKey(res.ServerElement);
+            var (title, message, icon) = FormatConnectionErrorMessage(exception, isGuacamole, isReconnect: false);
+            if (showPromptOnError)
+            {
+                MessageBox.Show(this, message, title, MessageBoxButtons.OK, icon);
+            }
+            SetStatus(isGuacamole ? "Falha ao iniciar a sessão do Apache Guacamole." : "Falha ao iniciar a conexão RDP.");
+            UpdateCommands();
+            return null;
+        }
+    }
+
+    internal QuickOpenOverlayForm? _activeQuickOpenOverlay;
+    internal bool StartHostConnectionOnQuickOpen = true;
+
+    internal QuickOpenOverlayForm OpenQuickOpen()
+    {
+        if (_activeQuickOpenOverlay is not null && !_activeQuickOpenOverlay.IsDisposed)
+        {
+            _activeQuickOpenOverlay.BringToFront();
+            _activeQuickOpenOverlay.Focus();
+            _activeQuickOpenOverlay.SearchBox.Focus();
+            return _activeQuickOpenOverlay;
+        }
+
+        QuickOpenOverlayForm overlay = new(_searchCatalog, this);
+        _activeQuickOpenOverlay = overlay;
+
+        overlay.ConnectRequested += async entry =>
+        {
+            if (StartHostConnectionOnQuickOpen)
+            {
+                await ExecuteQuickOpenConnectAsync(entry);
+            }
+        };
+
+        overlay.GoToSourceRequested += entry =>
+        {
+            ExecuteQuickOpenGoToSource(entry);
+        };
+
+        overlay.FormClosed += (_, _) =>
+        {
+            if (ReferenceEquals(_activeQuickOpenOverlay, overlay))
+            {
+                _activeQuickOpenOverlay = null;
+            }
+        };
+
+        overlay.Show(this);
+        return overlay;
+    }
+
+    internal async Task<RdpSession?> ExecuteQuickOpenConnectAsync(GlobalSearchEntry entry, bool startHostConnection = true, bool showPromptOnError = true)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+
+        IConnectionSource? source = _sources.FirstOrDefault(s => s.Id == entry.SourceId);
+        if (source is null)
+        {
+            if (showPromptOnError)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Não foi possível conectar ao servidor '{entry.DisplayName}': a origem correspondente não está carregada no workspace.",
+                    "Servidor indisponível",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            SetStatus($"Servidor '{entry.DisplayName}' indisponível: origem não encontrada.");
+            return null;
+        }
+
+        if (source is RdgFileSource { IsMissing: true } || source is GuacamoleInventorySource { IsMissing: true })
+        {
+            if (showPromptOnError)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Não foi possível conectar ao servidor '{entry.DisplayName}': a origem está marcada como inacessível no disco.",
+                    "Origem indisponível",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            SetStatus($"Servidor '{entry.DisplayName}' indisponível: origem inacessível.");
+            return null;
+        }
+
+        _activeSource = source;
+        RdgNode serverNode = RdgNode.Create(entry.ServerElement)
+            ?? new RdgNode(entry.ServerElement, RdgNodeKind.Server);
+
+        try
+        {
+            _workspaceTabs.SelectedTab = _sessionPage;
+            RdpSession session = GetOrCreateSession(serverNode);
+            _sessionTabs.SelectedTab = session.Page;
+            UpdateConnectionViews();
+
+            if (IsSessionActive(session))
+            {
+                SetStatus($"A sessão de {entry.DisplayName} já está ativa.");
+                return session;
+            }
+
+            if (startHostConnection)
+            {
+                if (session.Kind == SessionKind.GuacamoleWeb)
+                {
+                    UpdateCommands();
+                    await session.GuacamoleHost!.ConnectAsync();
+                }
+                else
+                {
+                    session.RdpHost!.ConnectTo(serverNode.HostName);
+                }
+            }
+
+            UpdateCommands();
+            return session;
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException
+                or System.Runtime.InteropServices.COMException
+                or System.Runtime.InteropServices.InvalidComObjectException
+                or TargetInvocationException)
+        {
+            if (IsDisposed || Disposing) return null;
+            bool isGuacamole = entry.GuacamoleReference is not null || entry.SourceKind == ConnectionSourceKind.GuacamoleInventory;
+            var (title, message, icon) = FormatConnectionErrorMessage(exception, isGuacamole, isReconnect: false);
+            if (showPromptOnError)
+            {
+                MessageBox.Show(this, message, title, MessageBoxButtons.OK, icon);
+            }
+            SetStatus(isGuacamole ? "Falha ao iniciar a sessão do Apache Guacamole." : "Falha ao iniciar a conexão RDP.");
+            UpdateCommands();
+            return null;
+        }
+    }
+
+    internal bool ExecuteQuickOpenGoToSource(GlobalSearchEntry entry)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+
+        if (entry.ServerElement is null)
+        {
+            SetStatus("Servidor indisponível na origem.");
+            return false;
+        }
+
+        TreeNode? target = FindTreeNode(_tree.Nodes, entry.ServerElement);
+        if (target is not null)
+        {
+            _tree.SelectedNode = target;
+            target.EnsureVisible();
+            SetStatus($"Localizado na origem: {entry.SourceDisplayName} ({entry.NodePath})");
+            return true;
+        }
+
+        SetStatus("Nó do servidor não encontrado na árvore.");
+        return false;
     }
 
     protected override void WndProc(ref Message m)
@@ -1805,9 +3248,15 @@ internal sealed class MainForm : Form
 
         if (m.Msg is WM_SETTINGCHANGE or WM_THEMECHANGED)
         {
-            if (ThemeManager.CurrentTheme == AppTheme.System)
+            if (IsHandleCreated && !_applyingTheme && ThemeManager.CurrentTheme == AppTheme.System)
             {
-                ThemeManager.NotifySystemThemeChanged();
+                BeginInvoke(new Action(() =>
+                {
+                    if (!IsDisposed && ThemeManager.CurrentTheme == AppTheme.System)
+                    {
+                        ThemeManager.NotifySystemThemeChanged();
+                    }
+                }));
             }
         }
 
@@ -1816,13 +3265,26 @@ internal sealed class MainForm : Form
 
     private void ApplyCurrentTheme()
     {
-        ThemeManager.ApplyTheme(this);
-        UpdateThemeMenu();
-        _workspaceTabs.Invalidate();
-        _sessionTabs.Invalidate();
-        _tree.Invalidate();
-        _thumbnail.BackColor = Color.Black;
-        _sessionPlaceholder.ForeColor = ThemeManager.TextMuted;
+        if (_applyingTheme)
+        {
+            return;
+        }
+
+        try
+        {
+            _applyingTheme = true;
+            ThemeManager.ApplyTheme(this);
+            UpdateThemeMenu();
+            _workspaceTabs.Invalidate();
+            _sessionTabs.Invalidate();
+            _tree.Invalidate();
+            _thumbnail.BackColor = Color.Black;
+            _sessionPlaceholder.ForeColor = ThemeManager.TextMuted;
+        }
+        finally
+        {
+            _applyingTheme = false;
+        }
     }
 
     private void UpdateThemeMenu()
@@ -1839,11 +3301,24 @@ internal sealed class MainForm : Form
         UpdateSelection();
     }
 
-    private static string GetTreeNodeText(RdgNode node)
+    private string GetTreeNodeText(RdgNode node)
     {
-        return node.Kind == RdgNodeKind.Server
-            ? $"    {node.Name}"
-            : node.Name;
+        if (node.Kind == RdgNodeKind.Server)
+        {
+            return $"    {node.Name}";
+        }
+
+        if (node.Kind == RdgNodeKind.File)
+        {
+            IConnectionSource? source = GetSourceForNode(node);
+            if (source is not null)
+            {
+                string marker = source.IsDirty ? " *" : string.Empty;
+                return $"{source.DisplayName}{marker}";
+            }
+        }
+
+        return node.Name;
     }
 
     private Color GetServerStatusColor(XElement serverElement)
@@ -1890,7 +3365,7 @@ internal sealed class MainForm : Form
         };
     }
 
-    private RdpSession GetOrCreateSession(RdgNode server)
+    internal RdpSession GetOrCreateSession(RdgNode server)
     {
         if (_sessions.TryGetValue(server.Element, out RdpSession? existing))
         {
@@ -1899,9 +3374,19 @@ internal sealed class MainForm : Form
             return existing;
         }
 
-        RdpSession session = _guacamoleReferences.TryGetValue(server.Element, out GuacamoleConnectionReference? reference)
-            ? new RdpSession(server.Element, server.Name, reference)
+        IConnectionSource source = GetSourceForNode(server) ?? _activeSource ?? _sources.First();
+
+        RdpSession session = source.GuacamoleReferences.TryGetValue(server.Element, out GuacamoleConnectionReference? reference)
+            ? new RdpSession(server.Element, server.Name, reference, source.Id)
             : new RdpSession(server.Element, server.Name);
+
+        SessionContext context = new(
+            source.Id,
+            source.DisplayName,
+            server.Element,
+            session);
+        session.Context = context;
+
         session.AttachStateChanged(OnRdpConnectionStateChanged);
         session.Page.Tag = session;
         _sessions.Add(server.Element, session);
@@ -1989,13 +3474,45 @@ internal sealed class MainForm : Form
         previous?.Dispose();
     }
 
+    internal string GetQualifiedSessionTitle(RdpSession session)
+    {
+        string? sourceDisplayName = null;
+        if (session.Context is not null)
+        {
+            IConnectionSource? source = _sources.FirstOrDefault(s => s.Id == session.Context.SourceId);
+            sourceDisplayName = source?.DisplayName ?? session.Context.SourceDisplayName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(sourceDisplayName))
+        {
+            string sourceName = Path.GetFileNameWithoutExtension(sourceDisplayName);
+            if (string.IsNullOrWhiteSpace(sourceName))
+            {
+                sourceName = sourceDisplayName;
+            }
+            return $"[{sourceName}] {session.DisplayName}";
+        }
+
+        return session.DisplayName;
+    }
+
     private void UpdateSessionTitles()
     {
         foreach (RdpSession session in _sessions.Values)
         {
-            if (!string.Equals(session.Page.Text, session.DisplayName, StringComparison.Ordinal))
+            if (session.Context is not null)
             {
-                session.Page.Text = session.DisplayName;
+                IConnectionSource? source = _sources.FirstOrDefault(s => s.Id == session.Context.SourceId);
+                if (source is not null && !string.Equals(session.Context.SourceDisplayName, source.DisplayName, StringComparison.Ordinal))
+                {
+                    session.Context.SourceDisplayName = source.DisplayName;
+                }
+            }
+
+            string qualifiedTitle = GetQualifiedSessionTitle(session);
+            if (!string.Equals(session.Page.Text, qualifiedTitle, StringComparison.Ordinal))
+            {
+                session.Page.Text = qualifiedTitle;
             }
         }
 
@@ -2012,30 +3529,47 @@ internal sealed class MainForm : Form
 
     private void UpdateSessionTitle(RdpSession session)
     {
-        if (!string.Equals(session.Page.Text, session.DisplayName, StringComparison.Ordinal))
+        if (session.Context is not null)
         {
-            session.Page.Text = session.DisplayName;
+            IConnectionSource? source = _sources.FirstOrDefault(s => s.Id == session.Context.SourceId);
+            if (source is not null && !string.Equals(session.Context.SourceDisplayName, source.DisplayName, StringComparison.Ordinal))
+            {
+                session.Context.SourceDisplayName = source.DisplayName;
+            }
+        }
+
+        string qualifiedTitle = GetQualifiedSessionTitle(session);
+        if (!string.Equals(session.Page.Text, qualifiedTitle, StringComparison.Ordinal))
+        {
+            session.Page.Text = qualifiedTitle;
         }
 
         UpdateSessionTabSizes();
         InvalidateSessionTabHeaders();
     }
 
+    private bool _updatingSessionTabSizes;
+
     private void UpdateSessionTabSizes()
     {
+        if (_updatingSessionTabSizes)
+        {
+            return;
+        }
+
         int tabCount = _sessionTabs.TabPages.Count;
         if (tabCount == 0)
         {
             return;
         }
 
-        int maxTextWidth = 0;
-        using (Graphics graphics = _sessionTabs.CreateGraphics())
+        _updatingSessionTabSizes = true;
+        try
         {
+            int maxTextWidth = 0;
             foreach (TabPage page in _sessionTabs.TabPages)
             {
                 int textWidth = TextRenderer.MeasureText(
-                    graphics,
                     page.Text,
                     Font,
                     Size.Empty,
@@ -2045,20 +3579,24 @@ internal sealed class MainForm : Form
                     maxTextWidth = textWidth;
                 }
             }
-        }
 
-        int fullTabWidth = Math.Max(DefaultSessionTabWidth, maxTextWidth + SessionTabHorizontalChrome);
-        int availableWidth = _sessionTabs.ClientSize.Width > 12
-            ? _sessionTabs.ClientSize.Width - 8
-            : _sessionPanel.ClientSize.Width - 8;
-        int targetWidth = availableWidth > 0 && (fullTabWidth * tabCount) > availableWidth
-            ? Math.Max(MinimumSessionTabWidth, availableWidth / tabCount)
-            : fullTabWidth;
-        int targetHeight = Math.Max(26, Font.Height + 10);
-        Size targetSize = new(targetWidth, targetHeight);
-        if (_sessionTabs.ItemSize != targetSize)
+            int fullTabWidth = Math.Max(DefaultSessionTabWidth, maxTextWidth + SessionTabHorizontalChrome);
+            int availableWidth = _sessionTabs.ClientSize.Width > 12
+                ? _sessionTabs.ClientSize.Width - 8
+                : _sessionPanel.ClientSize.Width - 8;
+            int targetWidth = availableWidth > 0 && (fullTabWidth * tabCount) > availableWidth
+                ? Math.Max(MinimumSessionTabWidth, availableWidth / tabCount)
+                : fullTabWidth;
+            int targetHeight = Math.Max(26, Font.Height + 10);
+            Size targetSize = new(targetWidth, targetHeight);
+            if (_sessionTabs.ItemSize != targetSize)
+            {
+                _sessionTabs.ItemSize = targetSize;
+            }
+        }
+        finally
         {
-            _sessionTabs.ItemSize = targetSize;
+            _updatingSessionTabSizes = false;
         }
     }
 
@@ -2097,14 +3635,24 @@ internal sealed class MainForm : Form
 
     private void RemoveGuacamoleReferencesFor(XElement element)
     {
-        XElement[] keys = _guacamoleReferences.Keys
-            .Where(key => ReferenceEquals(key, element)
-                || key.Ancestors().Any(ancestor => ReferenceEquals(ancestor, element)))
+        foreach (IConnectionSource source in _sources)
+        {
+            if (source is GuacamoleInventorySource guacSource)
+            {
+                guacSource.RemoveReferencesFor(element);
+            }
+        }
+    }
+
+    internal void CloseSessionsForSource(Guid sourceId)
+    {
+        RdpSession[] sessions = _sessions.Values
+            .Where(session => session.Context?.SourceId == sourceId)
             .ToArray();
 
-        foreach (XElement key in keys)
+        foreach (RdpSession session in sessions)
         {
-            _guacamoleReferences.Remove(key);
+            CloseSession(session);
         }
     }
 
@@ -2135,7 +3683,7 @@ internal sealed class MainForm : Form
         UpdateSessionTitles();
     }
 
-    private void CloseSession(RdpSession session)
+    internal void CloseSession(RdpSession session)
     {
         try
         {
@@ -2193,6 +3741,7 @@ internal sealed class MainForm : Form
         if (mode == ConnectionPaneMode.Hidden)
         {
             UpdateConnectionPaneMenu();
+            RequestWorkspaceSave();
             return;
         }
 
@@ -2208,6 +3757,7 @@ internal sealed class MainForm : Form
         }
 
         UpdateConnectionPaneMenu();
+        RequestWorkspaceSave();
     }
 
     private void ExpandAutoHideConnectionPane()
@@ -2260,7 +3810,7 @@ internal sealed class MainForm : Form
 
     private void AutoResizeConnectionPane()
     {
-        if (_workspaceSplit is null || _populatingTree)
+        if (_workspaceSplit is null || _populatingTree || !_tree.IsHandleCreated)
         {
             return;
         }
@@ -2274,7 +3824,8 @@ internal sealed class MainForm : Form
         if (_workspaceSplit is null
             || _populatingTree
             || _connectionPaneMode == ConnectionPaneMode.Hidden
-            || !_tree.Visible)
+            || !_tree.Visible
+            || !_tree.IsHandleCreated)
         {
             return;
         }
@@ -2288,19 +3839,17 @@ internal sealed class MainForm : Form
 
     private int CalculateOptimalConnectionPaneWidth()
     {
-        if (_tree.Nodes.Count == 0)
+        if (_tree.Nodes.Count == 0 || !_tree.IsHandleCreated)
         {
             return MinimumExpandedConnectionPaneWidth;
         }
 
         int maxNodeRight = 0;
-        using Graphics graphics = _tree.CreateGraphics();
         foreach (TreeNode node in GetVisibleTreeNodes(_tree.Nodes))
         {
             RdgNode? rdgNode = node.Tag as RdgNode;
             string displayText = rdgNode?.Name ?? node.Text;
             int textWidth = TextRenderer.MeasureText(
-                graphics,
                 displayText,
                 _tree.Font,
                 Size.Empty,
@@ -2309,10 +3858,8 @@ internal sealed class MainForm : Form
                 ? 3 + StatusCircleDiameter + StatusCircleSpacing
                 : 2;
 
-            int nodeLeft = node.Bounds.Left > 0
-                ? node.Bounds.Left
-                : ((node.Level + 1) * _tree.Indent) + 20;
-            int nodeRight = Math.Max(node.Bounds.Right, nodeLeft + statusWidth + textWidth + 8);
+            int nodeLeft = ((node.Level + 1) * _tree.Indent) + 20;
+            int nodeRight = nodeLeft + statusWidth + textWidth + 8;
             if (nodeRight > maxNodeRight)
             {
                 maxNodeRight = nodeRight;
@@ -2365,29 +3912,56 @@ internal sealed class MainForm : Form
 
     private void MarkChanged(string status)
     {
-        MarkDocumentModified();
+        MarkChanged(_activeSource, status);
+    }
+
+    private void MarkChanged(IConnectionSource? source, string status)
+    {
+        MarkDocumentModified(source);
         SetStatus(status);
     }
 
-    private void MarkDocumentModified()
+    private void MarkDocumentModified(IConnectionSource? source = null)
     {
-        if (_isGuacamoleInventory)
+        IConnectionSource? target = source ?? _activeSource;
+        target?.MarkModified();
+        if (target is not null)
         {
-            _isGuacamoleInventoryModified = true;
+            UpdateSourceNodeText(target);
         }
-
         UpdateTitle();
         UpdateCommands();
     }
 
     private void UpdateTitle()
     {
-        string documentName = _document.FilePath is not null
-            ? Path.GetFileName(_document.FilePath)
-            : (_isGuacamoleInventory ? "Guacamole" : "Novo arquivo");
+        if (_sources.Count == 0)
+        {
+            Text = "PRDC";
+            return;
+        }
 
-        string dirtyMarker = HasUnsavedChanges ? "*" : string.Empty;
-        Text = $"PRDC - {documentName}{dirtyMarker}";
+        if (_sources.Count == 1)
+        {
+            IConnectionSource source = _sources[0];
+            string dirtyMarker = source.IsDirty ? " *" : string.Empty;
+            Text = $"PRDC - {source.DisplayName}{dirtyMarker}";
+            return;
+        }
+
+        int dirtyCount = _sources.Count(s => s.IsDirty);
+        if (dirtyCount == 0)
+        {
+            Text = "PRDC - Workspace";
+        }
+        else if (dirtyCount == 1)
+        {
+            Text = "PRDC - Workspace [1 origem modificada]";
+        }
+        else
+        {
+            Text = $"PRDC - Workspace [{dirtyCount} origens modificadas]";
+        }
     }
 
     private void SetStatus(string status)
@@ -2399,6 +3973,299 @@ internal sealed class MainForm : Form
     {
         using AboutDialog dialog = new(Icon);
         dialog.ShowDialog(this);
+    }
+
+    private void InitializeWorkspace()
+    {
+        _isRestoringWorkspace = true;
+        try
+        {
+            LoadWorkspaceResult loadResult = WorkspaceManager.LoadWorkspace();
+            _isWorkspaceRecoveryMode = loadResult.IsRecoveryMode;
+            _currentWorkspaceId = loadResult.Workspace.WorkspaceId;
+
+            if (loadResult.IsCorrupted)
+            {
+                SetStatus($"Workspace corrompido foi isolado ({Path.GetFileName(loadResult.CorruptedBackupPath)}). Novo workspace iniciado.");
+            }
+            else if (loadResult.IsRecoveryMode)
+            {
+                SetStatus(loadResult.ErrorMessage ?? "Workspace em modo de recuperação (somente-leitura).");
+            }
+
+            ApplyWorkspaceLayout(loadResult.Workspace.Layout);
+
+            var loadedFavorites = FavoriteManager.ExtractFromWorkspace(loadResult.Workspace);
+            _favoriteManager = new FavoriteManager(loadedFavorites);
+
+            string workspaceFile = WorkspaceManager.WorkspaceFilePath;
+            _workspaceLoadedFromDisk = File.Exists(workspaceFile);
+
+            if (loadResult.Workspace.Sources.Count > 0)
+            {
+                ClearSources();
+
+                foreach (WorkspaceSourceEntry entry in loadResult.Workspace.Sources)
+                {
+                    if (string.Equals(entry.Type, "RdgFile", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (string.IsNullOrWhiteSpace(entry.Path))
+                        {
+                            continue;
+                        }
+
+                        if (File.Exists(entry.Path))
+                        {
+                            try
+                            {
+                                RdgFileSource rdgSource = RdgFileSource.Load(entry.Path, entry.Id);
+                                RegisterSource(rdgSource);
+                            }
+                            catch
+                            {
+                                RdgFileSource missingSource = RdgFileSource.CreateMissing(entry.Path, entry.Id);
+                                RegisterSource(missingSource);
+                            }
+                        }
+                        else
+                        {
+                            RdgFileSource missingSource = RdgFileSource.CreateMissing(entry.Path, entry.Id);
+                            RegisterSource(missingSource);
+                        }
+                    }
+                    else if (string.Equals(entry.Type, "GuacamolePortal", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Guid portalId = entry.PortalId ?? entry.Id ?? Guid.Empty;
+                        if (portalId == Guid.Empty)
+                        {
+                            continue;
+                        }
+
+                        string inventoryPath = GuacamolePortalManager.GetInventoryFilePath(portalId);
+                        if (File.Exists(inventoryPath))
+                        {
+                            try
+                            {
+                                GuacamoleCacheLoadResult cacheLoad = Task.Run(async () =>
+                                    await GuacamoleInventoryCache.LoadAsync(inventoryPath)).GetAwaiter().GetResult();
+
+                                if (cacheLoad.IsSuccess && cacheLoad.CacheRoot is not null)
+                                {
+                                    GuacamoleImportResult materialized = GuacamoleInventoryCache.Materialize(cacheLoad.CacheRoot);
+                                    string displayName = entry.DisplayName ?? "Portal Guacamole";
+                                    string metaPath = GuacamolePortalManager.GetMetadataFilePath(portalId);
+                                    if (File.Exists(metaPath))
+                                    {
+                                        try
+                                        {
+                                            string metaJson = File.ReadAllText(metaPath);
+                                            var meta = JsonSerializer.Deserialize<GuacamolePortalMetadata>(metaJson);
+                                            if (!string.IsNullOrWhiteSpace(meta?.DisplayName))
+                                            {
+                                                displayName = meta.DisplayName;
+                                            }
+                                        }
+                                        catch { }
+                                    }
+
+                                    GuacamoleInventorySource guacSource = GuacamoleInventorySource.FromImportResult(
+                                        materialized,
+                                        entry.Id ?? portalId,
+                                        displayName,
+                                        portalId);
+                                    RegisterSource(guacSource);
+                                }
+                                else
+                                {
+                                    GuacamoleInventorySource missingGuac = GuacamoleInventorySource.CreateMissing(
+                                        portalId,
+                                        entry.DisplayName,
+                                        entry.Id);
+                                    RegisterSource(missingGuac);
+                                }
+                            }
+                            catch
+                            {
+                                GuacamoleInventorySource missingGuac = GuacamoleInventorySource.CreateMissing(
+                                    portalId,
+                                    entry.DisplayName,
+                                    entry.Id);
+                                RegisterSource(missingGuac);
+                            }
+                        }
+                        else
+                        {
+                            GuacamoleInventorySource missingGuac = GuacamoleInventorySource.CreateMissing(
+                                portalId,
+                                entry.DisplayName,
+                                entry.Id);
+                            RegisterSource(missingGuac);
+                        }
+                    }
+                }
+
+                if (_sources.Count == 0)
+                {
+                    _untitledCounter = 1;
+                    RdgFileSource initialSource = RdgFileSource.CreateNew($"Sem título {_untitledCounter}");
+                    RegisterSource(initialSource);
+                    _activeSource = initialSource;
+                }
+                else
+                {
+                    if (loadResult.Workspace.State.ActiveSourceId is { } activeId)
+                    {
+                        _activeSource = _sources.FirstOrDefault(s => s.Id == activeId) ?? _sources[0];
+                    }
+                    else
+                    {
+                        _activeSource = _sources[0];
+                    }
+                }
+            }
+
+            _searchCatalog.BuildCatalog(_sources, _favoriteManager);
+        }
+        finally
+        {
+            _isRestoringWorkspace = false;
+        }
+    }
+
+    private void ApplyWorkspaceLayout(WorkspaceLayout layout)
+    {
+        if (layout.Window is { } window && window.Width.HasValue && window.Height.HasValue && window.X.HasValue && window.Y.HasValue)
+        {
+            Rectangle targetBounds = new(window.X.Value, window.Y.Value, window.Width.Value, window.Height.Value);
+            if (WorkspaceManager.IsWindowBoundsValid(targetBounds))
+            {
+                StartPosition = FormStartPosition.Manual;
+                Bounds = targetBounds;
+            }
+            else
+            {
+                StartPosition = FormStartPosition.CenterScreen;
+                Size = new Size(1200, 760);
+            }
+
+            if (window.IsMaximized == true)
+            {
+                WindowState = FormWindowState.Maximized;
+            }
+        }
+
+        if (layout.ConnectionPane?.Width is { } paneWidth && paneWidth >= 100)
+        {
+            _expandedConnectionPaneWidth = Math.Clamp(paneWidth, 100, Math.Max(200, Width - 300));
+        }
+
+        if (layout.SplitterDistance is { } splitterDistance && splitterDistance >= 100)
+        {
+            if (_workspaceSplit is not null)
+            {
+                int maxDistance = Math.Max(150, _workspaceSplit.Width - _workspaceSplit.Panel2MinSize);
+                _workspaceSplit.SplitterDistance = Math.Clamp(splitterDistance, 100, maxDistance);
+            }
+        }
+
+        if (layout.ConnectionPane?.IsVisible == false)
+        {
+            SetConnectionPaneMode(ConnectionPaneMode.Hidden);
+        }
+    }
+
+    internal WorkspaceDocument CreateWorkspaceSnapshot()
+    {
+        WorkspaceDocument doc = new()
+        {
+            WorkspaceId = _currentWorkspaceId != Guid.Empty ? _currentWorkspaceId : Guid.NewGuid(),
+            SchemaVersion = WorkspaceManager.CurrentSchemaVersion,
+            LastModifiedUtc = DateTime.UtcNow,
+            Sources = [],
+            Layout = new WorkspaceLayout
+            {
+                Window = new WindowBounds
+                {
+                    X = WindowState == FormWindowState.Normal ? Location.X : RestoreBounds.X,
+                    Y = WindowState == FormWindowState.Normal ? Location.Y : RestoreBounds.Y,
+                    Width = WindowState == FormWindowState.Normal ? Size.Width : RestoreBounds.Width,
+                    Height = WindowState == FormWindowState.Normal ? Size.Height : RestoreBounds.Height,
+                    IsMaximized = WindowState == FormWindowState.Maximized
+                },
+                ConnectionPane = new ConnectionPaneLayout
+                {
+                    IsVisible = _connectionPaneMode != ConnectionPaneMode.Hidden,
+                    Width = _expandedConnectionPaneWidth
+                },
+                SplitterDistance = _workspaceSplit?.SplitterDistance ?? _expandedConnectionPaneWidth
+            },
+            State = new WorkspaceState
+            {
+                ActiveSourceId = _activeSource?.Id
+            }
+        };
+
+        foreach (IConnectionSource source in _sources)
+        {
+            if (source is RdgFileSource rdgSource)
+            {
+                string? filePath = rdgSource.Document.FilePath ?? rdgSource.MissingFilePath;
+                if (!string.IsNullOrWhiteSpace(filePath))
+                {
+                    doc.Sources.Add(new WorkspaceSourceEntry
+                    {
+                        Type = "RdgFile",
+                        Id = rdgSource.Id,
+                        Path = filePath,
+                        DisplayName = Path.GetFileName(filePath)
+                    });
+                }
+            }
+            else if (source is GuacamoleInventorySource guacSource)
+            {
+                doc.Sources.Add(new WorkspaceSourceEntry
+                {
+                    Type = "GuacamolePortal",
+                    Id = guacSource.Id,
+                    PortalId = guacSource.PortalId ?? guacSource.Id,
+                    DisplayName = guacSource.DisplayName
+                });
+            }
+        }
+
+        FavoriteManager.ApplyToWorkspace(doc, _favoriteManager.Favorites);
+        return doc;
+    }
+
+    internal void RequestWorkspaceSave()
+    {
+        if (_populatingTree || _isRestoringWorkspace || _isWorkspaceRecoveryMode)
+        {
+            return;
+        }
+
+        _workspaceSaveDebounceTimer.Stop();
+        _workspaceSaveDebounceTimer.Start();
+    }
+
+    internal void SaveCurrentWorkspace()
+    {
+        _workspaceSaveDebounceTimer.Stop();
+
+        if (_isWorkspaceRecoveryMode || _isRestoringWorkspace)
+        {
+            return;
+        }
+
+        try
+        {
+            WorkspaceDocument snapshot = CreateWorkspaceSnapshot();
+            WorkspaceManager.SaveWorkspace(snapshot);
+        }
+        catch
+        {
+            // Falha não-fatal de salvamento silenciosa
+        }
     }
 }
 
@@ -2430,13 +4297,14 @@ internal sealed class RdpSession : IDisposable
     public RdpSession(
         XElement serverElement,
         string displayName,
-        GuacamoleConnectionReference guacamoleReference)
+        GuacamoleConnectionReference guacamoleReference,
+        Guid? portalId = null)
     {
         ServerElement = serverElement;
         DisplayName = displayName;
         Kind = SessionKind.GuacamoleWeb;
         GuacamoleReference = guacamoleReference;
-        GuacamoleHost = new GuacamoleSessionHost(guacamoleReference)
+        GuacamoleHost = new GuacamoleSessionHost(guacamoleReference, portalId ?? guacamoleReference.PortalId)
         {
             Dock = DockStyle.Fill
         };
@@ -2445,6 +4313,8 @@ internal sealed class RdpSession : IDisposable
     }
 
     public XElement ServerElement { get; }
+
+    public SessionContext? Context { get; internal set; }
 
     public string DisplayName { get; set; }
 

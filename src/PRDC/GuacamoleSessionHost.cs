@@ -44,10 +44,13 @@ internal sealed class GuacamoleSessionHost : UserControl
     private bool _disposed;
     private string _lastStateMessage = string.Empty;
 
-    public GuacamoleSessionHost(GuacamoleConnectionReference connectionReference)
+    public Guid PortalId { get; }
+
+    public GuacamoleSessionHost(GuacamoleConnectionReference connectionReference, Guid? portalId = null)
     {
         ArgumentNullException.ThrowIfNull(connectionReference);
 
+        PortalId = portalId ?? connectionReference.PortalId ?? Guid.Empty;
         ConnectionReference = connectionReference;
         TargetClientUri = connectionReference.BuildClientUri();
 
@@ -415,7 +418,9 @@ internal sealed class GuacamoleSessionHost : UserControl
 
     private async Task InitializeCoreWebView2InternalAsync()
     {
-        CoreWebView2Environment environment = await WebView2EnvironmentProvider.GetOrCreateAsync();
+        CoreWebView2Environment environment = PortalId != Guid.Empty
+            ? await WebView2EnvironmentPool.GetOrCreateForPortalAsync(PortalId)
+            : await WebView2EnvironmentProvider.GetOrCreateAsync();
         if (_disposed || IsDisposed || Disposing || _webView.IsDisposed)
         {
             return;

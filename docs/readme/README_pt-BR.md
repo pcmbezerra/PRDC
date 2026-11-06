@@ -13,7 +13,7 @@
 [![Windows x64](https://img.shields.io/badge/Windows-x64-0078D4?style=flat-square&logo=windows)](https://www.microsoft.com/windows)
 [![Licença MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-f4c430?style=flat-square)](../../LICENSE)
 
-**[Início rápido](#início-rápido) · [Funcionalidades](#funcionalidades) · [Documentação](#documentação) · [Como contribuir](../../CONTRIBUTING.md)**
+**[Início rápido](#início-rápido) · [Funcionalidades](#funcionalidades) · [Atalhos de Teclado](#atalhos-de-teclado) · [Documentação](#documentação) · [Como contribuir](../../CONTRIBUTING.md)**
 
 </div>
 
@@ -21,37 +21,59 @@
 > A fonte oficial do PRDC é [pcmbezerra/PRDC](https://github.com/pcmbezerra/PRDC).
 > O PRDC é um projeto independente, sem afiliação ou endosso da Microsoft.
 
-O PRDC organiza endpoints de Área de Trabalho Remota em arquivos `.rdg` compatíveis com o RDCMan e abre sessões dentro de uma interface nativa do Windows. Conexões `.rdg` tradicionais utilizam diretamente o controle ActiveX de Área de Trabalho Remota do Windows (`mstscax.dll`), enquanto conexões importadas de um portal Apache Guacamole são abertas dentro das abas de sessão do PRDC via Microsoft Edge WebView2 utilizando o frontend oficial do Guacamole e `guacd`.
+O PRDC organiza endpoints de Área de Trabalho Remota distribuídos em múltiplos arquivos `.rdg` (compatíveis com o RDCMan) e portais Apache Guacamole dentro de um workspace persistente unificado. Conexões `.rdg` tradicionais utilizam diretamente o controle ActiveX de Área de Trabalho Remota do Windows (`mstscax.dll`), enquanto conexões importadas de portais Apache Guacamole são abertas em abas de sessão do PRDC via Microsoft Edge WebView2 através do cliente web oficial do Guacamole e `guacd`.
+
+---
 
 ## Funcionalidades
 
-- Criar, abrir, editar e salvar arquivos `.rdg`.
-- Realizar login e importar grupos e conexões de servidores RDP a partir de um portal Apache Guacamole ("Login no Guacamole..." / `Ctrl+Shift+G`) e abrir essas sessões dentro de abas do PRDC via Microsoft Edge WebView2.
-- Manter conexões `.rdg` tradicionais utilizando `mstscax.dll`.
-- Organizar servidores em grupos aninhados.
-- Conectar simultaneamente a vários hosts em abas de sessão independentes.
-- Reconectar, desconectar, fazer logoff em sessões RDP nativas sem bloquear a interface ou fechar uma aba de sessão pelo botão `×`.
-- Exibir indicadores visuais por cor (vermelho quando desconectado, amarelo durante autenticação ou abertura do túnel Guacamole, verde para a sessão autenticada ativa e azul para sessões autenticadas em segundo plano) tanto na árvore de servidores quanto nas abas de sessão.
-- Ajustar automaticamente a largura da lista de conexões aos itens visíveis na árvore e expandir as abas de sessão para exibir o nome completo do servidor enquanto houver espaço disponível.
-- Manter uma miniatura atualizada de cada sessão RDP nativa na tela de detalhes.
-- Mostrar, ocultar ou ocultar automaticamente a lista de conexões do RDG.
-- Redimensionar automaticamente a resolução remota junto com a janela do aplicativo (suportado tanto em sessões RDP nativas ActiveX quanto em sessões WebView2 do Apache Guacamole via debounce e sensores nativos de redimensionamento).
-- Usar os diálogos nativos de credenciais e certificados do Windows para conexões `.rdg` e o portal oficial do Guacamole via WebView2 para sessões Guacamole.
-- Habilitar CredSSP, autenticação do servidor, clipboard e Smart Sizing nas sessões RDP nativas.
-- Acompanhar automaticamente o tema claro ou escuro do Windows.
-- Preservar elementos XML ainda não interpretados ao editar um RDG existente.
+- **Workspace Multi-RDG:** Abra, edite, gerencie e salve múltiplos arquivos `.rdg` simultaneamente na mesma janela.
+- **Integração Multi-Guacamole:** Autenticação e sincronização com múltiplos portais Apache Guacamole com cache transacional isolado no disco em `%LOCALAPPDATA%\PRDC\Portals\`.
+- **Workspace Persistente:** Gravação e restauração automática de origens abertas, estado da árvore, limites da janela e layout em `%LOCALAPPDATA%\PRDC\workspace.json`. Inclui recuperação tolerante a falhas com isolamento de backups de arquivos corrompidos.
+- **Favoritos Globais (`★ Favoritos`):** Coleção unificada de servidores prioritários no topo da árvore, independentemente da origem (`.rdg` ou portal Guacamole). Permite definir apelidos personalizados (`F2`), resolução heurística resiliente e sinalização visual de conexões órfãs.
+- **Busca Global e Quick Open (`Ctrl+P`):** Motor de indexação em memória de altíssimo desempenho capaz de pesquisar dezenas de milhares de servidores em menos de 3 milissegundos. Suporta buscas multitermo, bônus de relevância para favoritos, navegação por teclado, conexão direta (`Enter`) e navegação na árvore (`Ctrl+Enter`).
+- **Sessões Remotas Híbridas:**
+  - **RDP Nativo (`mstscax.dll`):** Resolução dinâmica em cascata (MsRdpClient11 até MsRdpClient6) garantindo compatibilidade no Windows 10, Windows 11 e Windows Server (2016-2025).
+  - **Apache Guacamole (WebView2):** Abas de sessão isoladas gerenciadas por `WebView2EnvironmentPool`, monitoramento de saúde do túnel e redimensionamento dinâmico de resolução via sensores DOM nativos.
+- **Isolamento de Contexto (`SessionContext`):** Cada sessão aberta preserva o vínculo imutável com sua respectiva origem ou portal.
+- **Temas Visuais:** Suporte integral aos temas Claro, Escuro e do Sistema do Windows, estendendo o Dark Mode para menus, árvore de navegação, abas e diálogos.
+- **Modo Tela Cheia (`F11`):** Visualização imersiva sem bordas com retorno transparente via `Esc` ou `F11`.
+- **Indicadores de Estado:** Indicadores coloridos por ponto (vermelho: desconectado, amarelo: conectando, verde: sessão ativa conectada, azul: sessões conectadas em segundo plano).
+
+---
+
+## Atalhos de Teclado
+
+| Atalho | Descrição |
+| :--- | :--- |
+| **`Ctrl+P`** | Abrir Busca Global / Quick Open |
+| **`Ctrl+D`** | Adicionar/remover servidor selecionado dos Favoritos |
+| **`Ctrl+G`** | Navegar até a origem do favorito selecionado |
+| **`F2`** | Renomear item selecionado (ou definir apelido para favorito) |
+| **`Ctrl+N`** | Criar um novo arquivo `.rdg` |
+| **`Ctrl+O`** | Abrir um arquivo `.rdg` existente no workspace |
+| **`Ctrl+S`** | Salvar alterações no documento ativo |
+| **`Ctrl+Shift+S`** | Salvar todos os documentos abertos no workspace |
+| **`Ctrl+Shift+G`** | Abrir diálogo de login do Apache Guacamole |
+| **`Ctrl+Shift+U`** | Atualizar inventário do portal Guacamole selecionado |
+| **`Ctrl+Shift+D`** | Desconectar a sessão remota ativa |
+| **`F11`** | Alternar modo Tela Cheia |
+| **`Esc`** | Sair de Tela Cheia / Fechar o Quick Open |
+| **`Enter`** | (No Quick Open) Conectar diretamente ao servidor selecionado |
+| **`Ctrl+Enter`** | (No Quick Open ou Árvore) Focar e selecionar o servidor na árvore |
+
+---
 
 ## Início rápido
 
 ### Requisitos
 
-- Windows 10 ou Windows 11 x64.
-- [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) para executar a versão framework-dependent padrão (um pacote self-contained experimental, pendente de validação em uma instalação do Windows sem o .NET 10 Desktop Runtime, também está disponível).
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) para compilar o código-fonte.
-- Microsoft Edge WebView2 Evergreen Runtime (x64) para abrir sessões do Apache Guacamole dentro do PRDC.
+- Windows 10 (1809+) ou Windows 11 x64; ou Windows Server 2019/2022/2025.
+- **Pacote Framework-Dependent:** Requer [.NET 10.0 Desktop Runtime (x64)](https://dotnet.microsoft.com/download/dotnet/10.0) e Microsoft Edge WebView2 Evergreen Runtime.
+- **Pacote Self-Contained:** Nenhuma dependência de .NET necessária! Runtime completo embutido em executável único.
 - Acesso de rede e autorização para o servidor RDP de destino ou portal Apache Guacamole.
 
-### Compilar e executar
+### Compilar e executar a partir do código-fonte
 
 ```powershell
 git clone https://github.com/pcmbezerra/PRDC.git
@@ -60,88 +82,47 @@ dotnet restore PRDC.sln
 dotnet run --project src/PRDC/PRDC.csproj
 ```
 
-Crie ou abra um `.rdg`, selecione um servidor e dê um duplo clique ou pressione `Ctrl+Enter`. Para desconectar, use `Ctrl+Shift+D`.
+---
 
-## Integração com Apache Guacamole
+## Exemplos de Uso
 
-O PRDC oferece integração nativa com portais Apache Guacamole, permitindo centralizar a organização, a persistência local e o acesso remoto a servidores RDP através do `guacd`.
+### 1. Trabalhando com Múltiplas Origens
+1. Abra o PRDC. O workspace persistente é inicializado automaticamente.
+2. Pressione `Ctrl+O` e selecione `Produção.rdg`.
+3. Pressione `Ctrl+O` novamente e selecione `Homologação.rdg`. Os dois arquivos passam a coexistir como nós raiz na árvore.
+4. Pressione `Ctrl+Shift+G` e informe as credenciais do seu portal Apache Guacamole corporativo. O inventário é adicionado como uma origem independente.
+5. Ao fechar o PRDC, todo o conjunto de origens e posições de janela são salvos atomicamente em `workspace.json`.
 
-| Recurso | Status |
-| :--- | :--- |
-| Login Guacamole | ✅ |
-| Cache Local | ✅ |
-| Atualização de Inventário | ✅ |
-| Exportação RDG | ✅ |
-| Sessões WebView2 | ✅ |
-| SSH | ❌ |
-| VNC | ❌ |
+### 2. Gerenciando Favoritos Globais
+1. Na árvore de conexões, selecione qualquer servidor de um arquivo RDG ou portal Guacamole.
+2. Pressione `Ctrl+D` (ou clique com botão direito e escolha **Adicionar aos Favoritos**).
+3. O servidor é referenciado no nó raiz **★ Favoritos**.
+4. Pressione `F2` para atribuir um apelido amigável (ex.: `Banco Primário de Produção`).
+5. Dê duplo clique no favorito para abrir a sessão remota diretamente no host correto.
 
-### Visão Geral
+### 3. Navegação Rápida com Quick Open (`Ctrl+P`)
+1. Pressione `Ctrl+P` em qualquer momento.
+2. Digite termos parciais, como `banco prod` ou `bastion cloud`.
+3. Navegue entre os resultados ranqueados utilizando as setas do teclado.
+4. Pressione `Enter` para conectar imediatamente ou `Ctrl+Enter` para localizar o nó correspondente na árvore.
 
-Os usuários podem se autenticar diretamente em um servidor Apache Guacamole para descobrir fontes de dados e importar todos os servidores RDP autorizados. A hierarquia de conexões é sincronizada, persistida localmente para operação offline e executada em abas de sessão aceleradas via Microsoft Edge WebView2.
-
-### Fluxo de Importação e Persistência
-
-1. **Login Direto**: Selecione `Arquivo > Login no Guacamole...` (`Ctrl+Shift+G`) e informe a URL do portal, usuário e senha.
-2. **Descoberta e Mapeamento de Hierarquia**: O PRDC consulta a API REST do Guacamole em todos os datasources disponíveis, extrai os grupos aninhados e conexões RDP, resolvendo nomes e hostnames em um documento RDCMan em memória.
-3. **Persistência em Cache Local**: O inventário importado é gravado automaticamente no cache canônico em `%LOCALAPPDATA%\PRDC\Guacamole\inventory.json` através de pipeline transacional atômico (UTF-8 sem BOM, escrita direta em hardware com `WriteThrough`, revalidação de integridade e `File.Replace`).
-4. **Operação Offline no Startup**: Nas próximas inicializações, o PRDC detecta e carrega o inventário em milissegundos a partir do disco, sem necessidade de rede, chamadas HTTP ou telas de login.
-5. **Atualização e Remoção de Inventário**:
-   - `Arquivo > Atualizar lista do Guacamole` (`Ctrl+Shift+U`): Reautentica no portal com a URL base preenchida e atualiza atomicamente o cache local e a árvore.
-   - `Arquivo > Remover inventário do Guacamole...`: Exclui com segurança o cache local e reseta a árvore, sem afetar o perfil de navegação do WebView2.
-6. **Exportação Opcional para RDG**:
-   - O usuário pode exportar o inventário ativo para um arquivo `.rdg` independente via `Arquivo > Salvar como...`.
-   - O atalho `Ctrl+S` / `Salvar` **nunca** sobrescreve o cache local (`inventory.json`).
-   - Durante a execução atual, as conexões exportadas mantêm o vínculo com o Guacamole; quando o arquivo `.rdg` for reaberto em uma execução futura, será tratado como documento tradicional (`mstscax.dll`).
-7. **Execução de Sessões via WebView2**:
-   - Conexões Guacamole operam dentro de abas dedicadas via WebView2, conectando-se diretamente ao cliente web oficial e ao túnel `guacd`.
-   - O redimensionamento dinâmico da resolução remota ajusta a tela automaticamente ao tamanho da janela usando eventos de sensor do DOM com debounce de 250 ms, sem reconectar ou interromper o túnel.
-
-### Características
-
-- Login direto no Guacamole
-- Importação automática de grupos e conexões
-- Cache local para operação offline
-- Atualização manual do inventário
-- Exportação opcional para RDCMan (.rdg)
-- Sessões executadas via WebView2
-
-### Limitações
-
-- Suporte somente para conexões RDP (conexões SSH e VNC são ignoradas na importação)
-- Credenciais nunca são persistidas (senhas, tokens e cookies de autenticação não vão para o disco)
-- Cache armazena apenas metadados necessários do inventário
-- Arquivos exportados RDG são tratados como documentos tradicionais quando reabertos (`mstscax.dll`)
-
-## Compatibilidade RDG e metadados de sessão Guacamole
-
-O PRDC implementa as partes de arquivo, grupo, servidor, nome de exibição, hostname e estado de expansão atualmente usadas pelo aplicativo. Elementos XML desconhecidos são preservados durante leitura e gravação, mas não há garantia de paridade com todas as configurações do RDCMan. Consulte [Compatibilidade RDG](../rdg-format.md).
-
-Os metadados de conexão do Apache Guacamole (`BaseUri`, `DataSource` e `ConnectionIdentifier`) existem apenas em memória durante a sessão importada atual e não são persistidos no XML `.rdg`. Após salvar e reabrir um arquivo `.rdg` importado do Guacamole, o vínculo Guacamole não é preservado: os nós passam a ser tratados como servidores `.rdg` tradicionais (`mstscax.dll`), e o acesso RDP direto pode falhar em redes segmentadas nas quais os servidores só são alcançáveis via `guacd`.
-
-Não salve nem faça commit de arquivos `.rdg` reais contendo hostnames internos, usuários, credenciais criptografadas ou outros metadados de infraestrutura.
-
-## Segurança e privacidade
-
-O PRDC não persiste diretamente senhas, `authToken`, cookies ou credenciais RDP. Para sessões `.rdg` tradicionais, a coleta de credenciais é conduzida pelo controle RDP nativo do Windows (`mstscax.dll`). Para sessões do Apache Guacamole, o WebView2 utiliza um perfil local em `%LOCALAPPDATA%\PRDC\WebView2\` inicializado com `--no-proxy-server`; esse perfil do WebView2 pode persistir cookies, `localStorage` (como `GUAC_AUTH`), cache e permissões entre abas e execuções. As permissões de câmera, microfone, geolocalização e notificações permanecem bloqueadas no MVP. As permissões da área de transferência permanecem sob a política padrão do WebView2; o PRDC não concede automaticamente acesso de leitura ao clipboard.
+---
 
 ## Documentação
 
-- [Índice da documentação](../index.md)
+- [Guia do Usuário](../user-guide.md)
 - [Arquitetura](../architecture.md)
 - [Desenvolvimento](../development.md)
 - [Compatibilidade RDG](../rdg-format.md)
-- [Política de segurança](../../SECURITY.md)
-- [Como contribuir](../../CONTRIBUTING.md)
-- [Histórico de alterações](../../CHANGELOG.md)
+- [Política de Segurança](../../SECURITY.md)
+- [Como Contribuir](../../CONTRIBUTING.md)
+- [Changelog](../../CHANGELOG.md)
 
-## Origem e independência
-
-O desenvolvimento inicial foi orientado por análise comportamental estática do Remote Desktop Connection Manager. O PRDC possui implementação independente e não distribui o RDCMan nem `mstscax.dll`.
+---
 
 ## Licença
 
-PRDC é disponibilizado sob a [Licença MIT](../../LICENSE).
+O PRDC é distribuído sob os termos da [Licença MIT](../../LICENSE).
 
 ## Autor
 

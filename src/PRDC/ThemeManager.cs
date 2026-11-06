@@ -240,8 +240,14 @@ internal static class ThemeManager
         switch (control)
         {
             case TreeView tree:
-                tree.BackColor = windowBg;
-                tree.ForeColor = textPrimary;
+                if (tree.BackColor != windowBg)
+                {
+                    tree.BackColor = windowBg;
+                }
+                if (tree.ForeColor != textPrimary)
+                {
+                    tree.ForeColor = textPrimary;
+                }
                 tree.LineColor = dark ? Color.FromArgb(80, 80, 80) : SystemColors.GrayText;
                 break;
 

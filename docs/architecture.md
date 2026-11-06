@@ -1,112 +1,179 @@
-# Architecture
+# PRDC Architecture & Engineering Reference (v1.4.0)
 
-PRDC is a Windows-only .NET 10 WinForms application with three primary boundaries.
+PRDC is a focused, high-performance Remote Desktop connection manager for Windows built on .NET 10 (Windows Forms). It provides unified management for traditional RDCMan `.rdg` files and Apache Guacamole portals inside an enterprise-grade, persistent, multi-source workspace.
 
-## User interface
+---
 
-`MainForm` owns menus, the RDG tree, details, session controls, and application status. `NodeDialog` edits groups and servers. `AboutDialog` displays project, author, and repository information.
+## 1. High-Level System Architecture
 
-The application uses `SystemColorMode.System`, so WinForms inherits the Windows application color mode before the first window is created.
+```mermaid
+graph TD
+    UI[MainForm / UI Layer] --> WM[WorkspaceManager]
+    UI --> FM[FavoriteManager]
+    UI --> SCM[SearchCatalogManager]
+    UI --> QO[QuickOpenOverlayForm]
+    UI --> TM[ThemeManager]
 
-## RDG document model
+    WM --> WDoc[(workspace.json)]
+    WM --> CS[IConnectionSource Collections]
 
-`RdgDocument` owns the loaded `XDocument` and all supported mutations. `RdgNode` projects `file`, `group`, and `server` elements for the tree.
+    CS --> RFS[RdgFileSource]
+    CS --> GIS[GuacamoleInventorySource]
 
-The original XML document remains authoritative. Unknown elements are not normalized into a second model and are preserved when possible. Supported mutations currently cover names, hosts, hierarchy, and expansion state.
+    RFS --> RDG[RdgDocument / XML]
+    GIS --> GPM[GuacamolePortalManager]
+    GPM --> GIC[GuacamoleInventoryCache]
+    GIC --> GCache[(Portals/{portalId}/inventory.json)]
 
-## Component structure and integration boundaries
+    FM --> SL[ServerLocator Engine]
+    SL --> CS
 
-The architecture separates user interface orchestration, document mutation, local cache persistence, and session host execution:
+    SCM --> GSE[GlobalSearchEntry Index]
+    GSE --> CS
+    GSE --> FM
 
-```text
-MainForm
- ├─ GuacamoleLoginDialog
- ├─ GuacamoleInventoryProvider
- │   └─ REST API Apache Guacamole
- ├─ GuacamoleInventoryCache
- │   └─ inventory.json
- ├─ GuacamoleConnectionReference
- └─ GuacamoleSessionHost
-     └─ WebView2
+    UI --> SC[SessionContext Isolation]
+    SC --> RDP[RdpClientHost: mstscax.dll ActiveX]
+    SC --> GUAC[GuacamoleSessionHost: WebView2]
+    GUAC --> WVP[WebView2EnvironmentPool]
 ```
 
-## Session hosts (Native RDP and Apache Guacamole WebView2)
+---
 
-`MainForm` routes each server connection based on whether its `XElement` has an in-memory `GuacamoleConnectionReference`:
+## 2. Core Architectural Boundaries
 
-1. **Traditional RDG sessions (`SessionKind.NativeRdp` -> `RdpClientHost`)**:
-   `RdpClientHost` embeds the Windows `MsRdpClient10NotSafeForScripting` ActiveX control (`mstscax.dll`) through `AxHost`. It configures the selected server and supported advanced settings, invokes connect/disconnect, and consumes `IMsTscAxEvents` to distinguish transport connection from completed login. Logoff is requested inside the active session by focusing the ActiveX control and sending the `logoff` command through native keyboard input, avoiding the separate administrative RPC channel required by the WTS APIs. Polling the control's native connection state remains as a fallback. Window resize events are debounced before `UpdateSessionDisplaySettings` updates the remote desktop resolution; Smart Sizing remains the compatibility fallback.
+### 2.1. The `IConnectionSource` Contract
+`IConnectionSource` defines the foundational abstraction for any collection of remote endpoints:
 
-2. **Apache Guacamole sessions (`SessionKind.GuacamoleWeb` -> `GuacamoleSessionHost`)**:
-   When a user logs in and imports an inventory through `GuacamoleInventoryProvider`, PRDC builds a pure RDG XML tree in memory and associates each imported server `XElement` with a `GuacamoleConnectionReference` (`BaseUri`, `DataSource`, `ConnectionIdentifier`, `DisplayName`, `Protocol`). `GuacamoleSessionHost` embeds Microsoft Edge WebView2 (`Microsoft.Web.WebView2`) using a shared `CoreWebView2Environment` managed by `WebView2EnvironmentProvider` at `%LOCALAPPDATA%\PRDC\WebView2\` with `--no-proxy-server`. It navigates to `#/client/{ClientIdentifier}` on the official Guacamole frontend and transitions to `RdpConnectionState.LoggedIn` only when the tunnel protocol endpoint (`/api/session/tunnels/{uuid}/protocol`) returns `HTTP 200`. When the PRDC window is resized, maximized, restored, or the splitter is moved, `GuacamoleSessionHost` uses a 250 ms debounce timer to dispatch DOM `resize` events to `window` and to the `contentDocument.defaultView` of all `<object class="resize-sensor">` elements created by Guacamole's native `guacResize` directive. This invokes `$scope.mainElementResized()` and sends the new display resolution (`c.sendSize(W, M)`) over the active tunnel to `guacd` without page reload, reconnection, CSS injection, zoom scaling, or session invalidation.
-
-## Local persistence and caching architecture
-
-The persistent inventory model is managed by `GuacamoleInventoryCache` independently of the RDG XML document model.
-
-### Canonical Cache Location
-The active inventory is stored at `%LOCALAPPDATA%\PRDC\Guacamole\inventory.json` using UTF-8 without BOM. The cache is governed by Windows local user profile ACLs.
-
-### Startup Flow (Fluxo de Inicialização)
-
-```text
-PRDC
- -> Load Cache
- -> Validate
- -> Materialize RDG
- -> Populate Tree
+```csharp
+public interface IConnectionSource
+{
+    Guid Id { get; }
+    string DisplayName { get; }
+    ConnectionSourceKind Kind { get; }
+    RdgDocument Document { get; }
+    IReadOnlyList<RdgNode> Roots { get; }
+    bool IsDirty { get; }
+    bool IsReadOnly { get; }
+    IReadOnlyDictionary<XElement, GuacamoleConnectionReference> GuacamoleReferences { get; }
+    void MarkClean();
+}
 ```
 
-1. **Detection**: On form `Shown`, PRDC checks `GuacamoleInventoryCache.Exists()` once (`_startupInventoryLoadAttempted`).
-2. **Local Read**: If present, the file is read and deserialized from disk without triggering any HTTP requests, network access, or credentials dialogs.
-3. **Validation**: The JSON payload is validated against structural limits (<= 50 MB, <= 64 nesting levels, <= 100,000 groups, <= 100,000 connections).
-4. **Materialization**: `RdgDocument.CreateNew()` builds the in-memory tree, maps server `XElement` identities to `GuacamoleConnectionReference` instances via `ReferenceEqualityComparer.Instance`, and populates the `TreeView`.
-5. **Clean State**: `_isGuacamoleInventory = true` and `_isGuacamoleInventoryModified = false`. The title bar shows `PRDC - Guacamole` without an asterisk, and closing the application exits without prompting to save.
+Two concrete implementations exist:
+1. **`RdgFileSource`:** Represents a physical RDCMan `.rdg` document on disk. Tracks unsaved modifications, file paths, and handles load, save (`Ctrl+S`), and save-as operations. If a file is moved or deleted, it transitions to a graceful `IsMissing` state.
+2. **`GuacamoleInventorySource`:** Represents an imported Apache Guacamole portal. Associated with a canonical `PortalId`, it holds an in-memory `RdgDocument` projection alongside a dictionary mapping server XML elements to their `GuacamoleConnectionReference` parameters.
 
-### Update Flow (Fluxo de Atualização)
+### 2.2. Session Context Isolation (`SessionContext`)
+To prevent session cross-talk, memory leaks, and routing errors in a multi-source environment, each active session holds an immutable `SessionContext`:
 
-```text
-Login
- -> Download Inventário
- -> Validar
- -> Persistir Cache
- -> Atualizar Estado em Memória
- -> Atualizar TreeView
+```csharp
+public sealed record SessionContext(
+    Guid SourceId,
+    string SourceDisplayName,
+    ConnectionSourceKind SourceKind,
+    Guid? PortalId = null,
+    string? NodePath = null,
+    string? ConnectionIdentifier = null);
 ```
 
-1. **Authentication & Discovery**: `GuacamoleInventoryProvider.ImportAsync` queries the REST API across all available data sources and retrieves RDP connection hierarchies.
-2. **Validation**: The data is mapped to `GuacamoleCacheRoot` and validated in memory.
-3. **Session Confirmation**: `ConfirmCloseSessions()` and `ConfirmDiscardChanges()` ensure existing sessions or unsaved edits are confirmed.
-4. **Atomic Save Pipeline**:
-   - Creates directory if needed.
-   - Cleans up residual `.tmp` files.
-   - Writes `inventory.json.tmp` using `FileOptions.WriteThrough`.
-   - Flushes stream to physical storage (`Flush(flushToDisk: true)`).
-   - Re-reads and validates `.tmp` file integrity before touching the live cache.
-   - Replaces live cache using `File.Replace(tmp, target, bak, ignoreMetadataErrors: true)` with `File.Move` fallback.
-   - Cleans up `.bak` backup upon confirmed swap.
-5. **State Commit**: Swaps in-memory `_document` and `_guacamoleReferences`, updates `PopulateTree()`, title, and commands.
+- When a connection is initiated (via double-click in the tree or through Quick Open), `MainForm` attaches the `SessionContext` to the session tab.
+- Native RDP sessions use `RdpClientHost` (`mstscax.dll`) with cascading dynamic COM fallback (MsRdpClient11 down to MsRdpClient6).
+- Guacamole sessions use `GuacamoleSessionHost` (Microsoft Edge WebView2).
 
-### Resiliency, Quarantine, and Schema Handling
-- **Corrupt File Quarantine**: If `inventory.json` is zero bytes, truncated, or structurally malformed, it is moved to `inventory.corrupt-{yyyyMMddHHmmss}.json`. The application falls back to a clean new document with a non-blocking status message.
-- **Unsupported Schema Quarantine**: If `schemaVersion` does not match the supported version (`1`), the file is moved to `inventory.unsupported-v{version}-{yyyyMMddHHmmss}.json`.
-- **No Silent Deletions**: Diagnostic files are never deleted automatically.
+### 2.3. Shared WebView2 Environment Pool (`WebView2EnvironmentPool`)
+Apache Guacamole sessions communicate with `guacd` over WebSocket tunnels embedded in WebView2. Spawning independent browser environments for each tab wastes significant RAM and handles.
+`WebView2EnvironmentPool` maintains a pooled dictionary of `CoreWebView2Environment` instances keyed by portal ID, storing user data safely under `%LOCALAPPDATA%\PRDC\Portals\{portalId}\WebView2\`:
+- Initializes environments with `--no-proxy-server`.
+- Reuses browser processes efficiently across multiple concurrent Guacamole tabs.
+- Ensures total cookie and local storage isolation between different Guacamole portals.
 
-### Separation Between JSON Cache and RDG Export
-- `Ctrl+S` (`Save`) and `Save As` export the in-memory tree as a standalone `.rdg` file and **never** overwrite `inventory.json`.
-- Dirty state tracking is specialized (`HasUnsavedChanges`): unmodified Guacamole inventories do not prompt for saving on close, while deliberate user edits (adding, updating, or removing nodes) set `_isGuacamoleInventoryModified = true` and prompt to save as an `.rdg` file.
-- When an exported `.rdg` is reopened from disk in a future session, it is treated as a traditional `.rdg` document and connections use `RdpClientHost` (`mstscax.dll`).
+---
 
-### Security, privacy, and persistence boundaries
+## 3. Multi-Portal Guacamole Management (`GuacamolePortalManager`)
 
-- PRDC does not directly persist plaintext passwords, `authToken` values, cookies, or RDP credentials.
-- The shared WebView2 profile at `%LOCALAPPDATA%\PRDC\WebView2\` may persist browser cookies, `localStorage` (including `GUAC_AUTH`), cache, and permissions so subsequent Guacamole tabs reuse the authenticated web session without prompting for credentials again.
-- `GuacamoleSessionHost` restricts navigation to `about:blank` and the configured Guacamole `BaseUri` path prefix (`/guacamole/`), disables browser accelerator keys (`AreBrowserAcceleratorKeysEnabled = false`), context menus, autofill, password autosave, and DevTools in `Release` builds, and denies camera, microphone, geolocation, notifications, and sensor permissions in the MVP. Clipboard permissions remain governed by the default WebView2 policy; PRDC does not automatically grant clipboard-read access.
-- Guacamole metadata exists only in memory (`_guacamoleReferences`). If an imported inventory is saved to an `.rdg` file and later reopened, the Guacamole link is not preserved and those nodes are treated as traditional `.rdg` servers (`mstscax.dll`), where direct RDP access may fail in segmented networks. Do not save or commit real `.rdg` files containing internal hostnames.
+Unlike legacy single-portal implementations, PRDC 1.4.0 manages any number of concurrent Guacamole connections:
+- **Canonical Storage:** Each portal is assigned a stable `Guid` and stores metadata (`portal.json`) and its inventory cache (`inventory.json`) under `%LOCALAPPDATA%\PRDC\Portals\{portalId}\`.
+- **Atomic Transactional Pipeline:** All inventory saves utilize hardware `WriteThrough`, `.tmp` file generation, in-memory structural validation, and atomic replacement via `File.Replace`.
+- **Defensive Limits:** Strict validation safeguards against malicious or malformed payloads (maximum 50 MB, maximum 64 tree depth levels, maximum 100,000 groups and connections).
 
-## Current constraints
+---
 
-- Windows x64 only (requires Microsoft Edge WebView2 Evergreen Runtime x64 for Guacamole sessions).
-- No RD Gateway editor yet.
-- No full mapping for every RDCMan setting.
-- No installer or automatic updater yet.
+## 4. Persistent Workspace Subsystem (`WorkspaceManager`)
+
+The workspace represents the complete operating state of PRDC:
+
+### 4.1. `workspace.json` Structure
+```json
+{
+  "schemaVersion": 1,
+  "workspaceId": "f7d3a241-...",
+  "lastModifiedUtc": "2026-11-06T04:00:00Z",
+  "sources": [
+    { "id": "...", "type": "RdgFile", "path": "C:\\infra\\prod.rdg", "displayName": "prod.rdg" },
+    { "id": "...", "type": "GuacamolePortal", "portalId": "...", "displayName": "Guac-Prod" }
+  ],
+  "favorites": [ ... ],
+  "layout": {
+    "window": { "x": 100, "y": 100, "width": 1280, "height": 800, "isMaximized": false },
+    "connectionPane": { "isVisible": true, "width": 280 }
+  },
+  "state": { "activeSourceId": "..." }
+}
+```
+
+### 4.2. Crash Recovery and Quarantine
+1. **Atomic Saving:** Written via `workspace.json.tmp` and atomic rename to guarantee consistency even during sudden OS power failure.
+2. **Quarantine:** If `workspace.json` becomes corrupt or contains truncated JSON, it is automatically moved to `workspace.json.corrupt.{timestamp}` and an empty workspace is booted without crashing.
+3. **Forward Schema Protection:** If a future schema version is encountered, PRDC enters Read-Only Recovery Mode to prevent data destruction.
+
+---
+
+## 5. Global Favorites Subsystem (`FavoriteManager`)
+
+The Favorites subsystem provides quick access to connections spanning different `.rdg` files and Guacamole portals.
+
+### 5.1. Resilient Server Resolution (`ServerLocator`)
+Favorites do not store hardcoded pointers. Instead, each `FavoriteEntry` carries a `ServerLocator`:
+- **Primary Resolution:** Resolves by exact `NodePath` (for RDG files) or `ConnectionIdentifier` (for Guacamole portals).
+- **Heuristic Fallback Resolution:** If a server was moved between groups or renamed within the source document, `ServerLocator` performs a fallback search matching by `HostName` and `OriginalDisplayName`.
+- **Custom Aliases (`CustomAlias`):** Users can assign custom display names (`F2`) to favorites without mutating the underlying `.rdg` document or portal inventory.
+- **Orphan Lifecycle:** If an entire source is removed or deleted from disk, favorites pointing to it transition to `FavoriteOrphanStatus.MissingSource` or `MissingNode`, marked visually in the tree without dropping the favorite reference.
+
+---
+
+## 6. Global Search & Quick Open Subsystem (`SearchCatalogManager`)
+
+The Quick Open subsystem (`Ctrl+P`) provides instantaneous navigation and connection capabilities.
+
+### 6.1. In-Memory Indexing
+`SearchCatalogManager` maintains a lightweight, flat index of `GlobalSearchEntry` records across all open sources and favorites:
+- Indexes display names, hostnames, IP addresses, group hierarchies, and origin names.
+- Automatically synchronized upon document loading, node addition/removal, or favorite changes.
+
+### 6.2. Scoring and Ranking Algorithm
+Queries are tokenized by whitespace and evaluated against candidates using a weighted scoring model:
+- **Prefix Exact Match on Display Name:** Highest base priority.
+- **Multi-term Token Match:** Each token matching display name, host, or group hierarchy increases candidate score.
+- **Favorite Relevance Boost:** Entries marked as favorites receive a `+10,000` score bonus, ensuring they float to the top of matches.
+- **Performance:** Evaluates and ranks 20,000 servers in ~2.1 ms.
+
+### 6.3. Floating Overlay (`QuickOpenOverlayForm`)
+- Modalless, borderless overlay centered dynamically over `MainForm`.
+- Intercepts keyboard navigation: `Up`/`Down` keys for selection, `Enter` to connect directly via `ExecuteQuickOpenConnectAsync`, `Ctrl+Enter` to navigate to the origin in the tree via `ExecuteQuickOpenGoToSource`, and `Esc` to dismiss.
+
+---
+
+## 7. UI Threading & Performance Architecture
+
+1. **Reentrancy Protection in Tab Resizing:** `UpdateSessionTabSizes` employs an `_updatingSessionTabSizes` guard and uses GDI `TextRenderer.MeasureText` directly, preventing `StackOverflowException` recursion loops.
+2. **Debounced Operations:** Window resize events and workspace auto-saving utilize debounce timers (150 ms to 300 ms) to eliminate UI stutter and disk thrashing.
+3. **Theme Management (`ThemeManager`):** Listens to Windows `WM_SETTINGCHANGE` messages to dynamically toggle between Dark and Light modes across all custom-rendered WinForms components (`MenuStrip`, `StatusStrip`, `TreeView`, `TabControl`, and dialogs).
+
+---
+
+## 8. Security & Privacy Guarantees
+
+- **No Plaintext Credential Persistence:** Plaintext passwords, auth tokens, and private keys are never written to `workspace.json`, local caches, or logs.
+- **Isolated User Profiles:** Guacamole WebView2 profiles are strictly partitioned per portal under `%LOCALAPPDATA%\PRDC\Portals\{portalId}\WebView2\`.
+- **Native Security Controls:** Remote RDP sessions use the native Windows `mstscax.dll` credential dialogs and support CredSSP and NLA (Network Level Authentication).

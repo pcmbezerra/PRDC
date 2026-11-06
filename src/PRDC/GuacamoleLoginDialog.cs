@@ -4,6 +4,11 @@ internal sealed class GuacamoleLoginDialog : Form
 {
     public const string PlaceholderGuacamoleUrl = "http://guacamole.example.local/guacamole/";
 
+    private readonly TextBox _nameTextBox = new()
+    {
+        Dock = DockStyle.Fill,
+        PlaceholderText = "ex: Guac-Prod, Guac-Hml"
+    };
     private readonly TextBox _urlTextBox = new()
     {
         Dock = DockStyle.Fill,
@@ -16,7 +21,7 @@ internal sealed class GuacamoleLoginDialog : Form
         UseSystemPasswordChar = true
     };
 
-    public GuacamoleLoginDialog(string? defaultUrl = null)
+    public GuacamoleLoginDialog(string? defaultUrl = null, string? defaultDisplayName = null)
     {
         Text = "Login no Guacamole";
         StartPosition = FormStartPosition.CenterParent;
@@ -28,13 +33,14 @@ internal sealed class GuacamoleLoginDialog : Form
         AutoSizeMode = AutoSizeMode.GrowAndShrink;
         Padding = new Padding(12);
 
+        _nameTextBox.Text = defaultDisplayName ?? string.Empty;
         _urlTextBox.Text = defaultUrl ?? string.Empty;
 
         TableLayoutPanel layout = new()
         {
             AutoSize = true,
             ColumnCount = 2,
-            RowCount = 4,
+            RowCount = 5,
             Dock = DockStyle.Fill
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -42,27 +48,35 @@ internal sealed class GuacamoleLoginDialog : Form
 
         layout.Controls.Add(new Label
         {
-            Text = "URL do Guacamole:",
+            Text = "Nome do portal:",
             AutoSize = true,
             Anchor = AnchorStyles.Left
         }, 0, 0);
-        layout.Controls.Add(_urlTextBox, 1, 0);
+        layout.Controls.Add(_nameTextBox, 1, 0);
+
+        layout.Controls.Add(new Label
+        {
+            Text = "URL do Guacamole:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left
+        }, 0, 1);
+        layout.Controls.Add(_urlTextBox, 1, 1);
 
         layout.Controls.Add(new Label
         {
             Text = "Usuário:",
             AutoSize = true,
             Anchor = AnchorStyles.Left
-        }, 0, 1);
-        layout.Controls.Add(_userTextBox, 1, 1);
+        }, 0, 2);
+        layout.Controls.Add(_userTextBox, 1, 2);
 
         layout.Controls.Add(new Label
         {
             Text = "Senha:",
             AutoSize = true,
             Anchor = AnchorStyles.Left
-        }, 0, 2);
-        layout.Controls.Add(_passwordTextBox, 1, 2);
+        }, 0, 3);
+        layout.Controls.Add(_passwordTextBox, 1, 3);
 
         FlowLayoutPanel buttons = new()
         {
@@ -77,7 +91,7 @@ internal sealed class GuacamoleLoginDialog : Form
         buttons.Controls.Add(cancelButton);
         buttons.Controls.Add(okButton);
 
-        layout.Controls.Add(buttons, 0, 3);
+        layout.Controls.Add(buttons, 0, 4);
         layout.SetColumnSpan(buttons, 2);
         Controls.Add(layout);
 
@@ -85,6 +99,10 @@ internal sealed class GuacamoleLoginDialog : Form
         CancelButton = cancelButton;
         ThemeManager.ApplyTheme(this);
     }
+
+    public string PortalDisplayName => string.IsNullOrWhiteSpace(_nameTextBox.Text)
+        ? "Guacamole"
+        : _nameTextBox.Text.Trim();
 
     public string ServerUrl => _urlTextBox.Text.Trim();
 

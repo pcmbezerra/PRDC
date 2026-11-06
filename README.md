@@ -13,7 +13,7 @@
 [![Windows x64](https://img.shields.io/badge/Windows-x64-0078D4?style=flat-square&logo=windows)](https://www.microsoft.com/windows)
 [![MIT license](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
 
-**[Quick start](#quick-start) · [Features](#features) · [Documentation](#documentation) · [Contributing](CONTRIBUTING.md)**
+**[Quick start](#quick-start) · [Features](#features) · [Keyboard Shortcuts](#keyboard-shortcuts) · [Documentation](#documentation) · [Contributing](CONTRIBUTING.md)**
 
 </div>
 
@@ -21,37 +21,59 @@
 > The official source for PRDC is [pcmbezerra/PRDC](https://github.com/pcmbezerra/PRDC).
 > PRDC is an independent project and is not affiliated with or endorsed by Microsoft.
 
-PRDC organizes Remote Desktop endpoints in RDCMan-compatible `.rdg` files and opens sessions inside a native Windows desktop interface. Traditional `.rdg` servers connect directly through the Windows Remote Desktop ActiveX control (`mstscax.dll`), while connections imported from an Apache Guacamole portal open inside PRDC session tabs via Microsoft Edge WebView2 through the official Guacamole web client and `guacd`.
+PRDC organizes Remote Desktop endpoints across multiple RDCMan-compatible `.rdg` files and Apache Guacamole portals inside a unified, persistent workspace. Traditional `.rdg` servers connect directly through the Windows Remote Desktop ActiveX control (`mstscax.dll`), while connections from Apache Guacamole portals open in PRDC session tabs via Microsoft Edge WebView2 through the official Guacamole web client and `guacd`.
+
+---
 
 ## Features
 
-- Create, open, edit, and save `.rdg` files.
-- Authenticate and import RDP server groups and connections from an Apache Guacamole portal ("Login to Guacamole..." / `Ctrl+Shift+G`) and open those sessions inside PRDC tabs via Microsoft Edge WebView2.
-- Keep traditional `.rdg` connections running natively on `mstscax.dll`.
-- Organize servers into nested groups.
-- Connect to multiple hosts simultaneously in independent session tabs.
-- Reconnect, disconnect, log off native RDP sessions without blocking the UI, or close an individual session tab with its `×` button.
-- Show color-coded status indicators (red when disconnected, yellow while authenticating or waiting for the Guacamole tunnel, green for the active authenticated session, and blue for background authenticated sessions) in both the server tree and session tabs.
-- Automatically resize the connection list width to fit visible tree items and expand session tabs to show the full server name when space permits.
-- Keep a live thumbnail of each native RDP session in the details view.
-- Show, hide, or automatically hide the RDG connection list.
-- Resize the remote desktop resolution automatically with the application window (supported on both native ActiveX RDP sessions and Apache Guacamole WebView2 sessions via debounced resize sensor events).
-- Use the native Windows credential and certificate dialogs for `.rdg` connections and the official Guacamole web portal inside WebView2 for Guacamole connections.
-- Enable CredSSP, server authentication, clipboard redirection, and smart sizing on native RDP sessions.
-- Follow the Windows light or dark application theme automatically.
-- Preserve unsupported XML elements when editing an existing RDG document.
+- **Multi-RDG Workspace:** Open, edit, manage, and save multiple `.rdg` files simultaneously in a single workspace.
+- **Multi-Guacamole Integration:** Authenticate against and synchronize multiple Apache Guacamole portals with isolated transactional disk caches under `%LOCALAPPDATA%\PRDC\Portals\`.
+- **Persistent Workspace:** Automatically saves open sources, tree state, window bounds, and layout to `%LOCALAPPDATA%\PRDC\workspace.json`. Includes automatic recovery and backup isolation against corrupted files.
+- **Global Favorites (`★ Favoritos`):** Pin frequently used servers into a unified top-level root node regardless of their origin (`.rdg` file or Guacamole portal). Supports custom aliases (`F2`), resilient primary and heuristic fallback resolution, and visual orphan status tracking.
+- **Global Search & Quick Open (`Ctrl+P`):** High-performance in-memory search index querying tens of thousands of servers in under 3 milliseconds. Features multi-term token matching, favorite scoring boosts, keyboard navigation, direct connection (`Enter`), and jump-to-tree (`Ctrl+Enter`).
+- **Hybrid Remote Sessions:**
+  - **Native RDP (`mstscax.dll`):** Automatic cascading fallback (MsRdpClient11 down to MsRdpClient6) ensuring compatibility across Windows 10, Windows 11, and Windows Server (2016-2025).
+  - **Apache Guacamole (WebView2):** Isolated session tabs powered by `WebView2EnvironmentPool` with automated tunnel health monitoring and dynamic resolution resizing via debounced DOM sensors.
+- **Session Isolation (`SessionContext`):** Every remote session maintains immutable context linking back to its originating document or portal.
+- **Visual Themes:** Full support for Windows Light, Dark, and System themes, applying dark mode to window chrome, menus, tree views, tabs, and dialogs.
+- **Full Screen Mode (`F11`):** Borderless immersive full screen with seamless restoration via `Esc` or `F11`.
+- **Session Indicators:** Color-coded status dots (red: disconnected, yellow: connecting, green: active connected session, blue: background connected sessions).
+
+---
+
+## Keyboard Shortcuts
+
+| Shortcut | Description |
+| :--- | :--- |
+| **`Ctrl+P`** | Open Global Search / Quick Open overlay |
+| **`Ctrl+D`** | Toggle Favorite status for the selected server |
+| **`Ctrl+G`** | Navigate to the origin document/portal of a favorite |
+| **`F2`** | Rename selected item (or set custom alias on a favorite) |
+| **`Ctrl+N`** | Create a new `.rdg` document |
+| **`Ctrl+O`** | Open an existing `.rdg` file into the workspace |
+| **`Ctrl+S`** | Save changes to the active document |
+| **`Ctrl+Shift+S`** | Save all open documents in the workspace |
+| **`Ctrl+Shift+G`** | Open Apache Guacamole login dialog |
+| **`Ctrl+Shift+U`** | Refresh inventory for the selected Guacamole portal |
+| **`Ctrl+Shift+D`** | Disconnect active remote desktop session |
+| **`F11`** | Toggle Full Screen mode |
+| **`Esc`** | Exit Full Screen / Close Quick Open overlay |
+| **`Enter`** | (In Quick Open) Connect directly to the selected server |
+| **`Ctrl+Enter`** | (In Quick Open or Tree) Focus and navigate to the selected server in the tree |
+
+---
 
 ## Quick start
 
 ### Requirements
 
-- Windows 10 or Windows 11, x64.
-- [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) to run the standard framework-dependent release (an experimental self-contained package pending validation on a Windows installation without the .NET 10 Desktop Runtime is also available).
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) to build from source.
-- Microsoft Edge WebView2 Evergreen Runtime (x64) to open Apache Guacamole sessions inside PRDC.
-- Network access and authorization for the target Remote Desktop host or Apache Guacamole portal.
+- Windows 10 (1809+) or Windows 11, x64; or Windows Server 2019/2022/2025.
+- **Framework-Dependent Release:** Requires [.NET 10.0 Desktop Runtime (x64)](https://dotnet.microsoft.com/download/dotnet/10.0) and Microsoft Edge WebView2 Evergreen Runtime.
+- **Self-Contained Release:** Zero .NET dependencies required! Includes complete runtime embedded in a single executable.
+- Target Remote Desktop host or Apache Guacamole portal connectivity.
 
-### Build and run
+### Build and run from source
 
 ```powershell
 git clone https://github.com/pcmbezerra/PRDC.git
@@ -60,106 +82,69 @@ dotnet restore PRDC.sln
 dotnet run --project src/PRDC/PRDC.csproj
 ```
 
-Create or open an `.rdg` file, select a server, then double-click it or press `Ctrl+Enter`. Disconnect with `Ctrl+Shift+D`.
+---
 
-## Apache Guacamole Integration
+## Usage Examples
 
-PRDC provides integrated support for Apache Guacamole portals, enabling seamless organization, local persistence, and remote access to RDP servers through `guacd`.
+### 1. Working with Multiple Connection Sources
+1. Open PRDC. An initial workspace is automatically initialized.
+2. Press `Ctrl+O` to open `Production.rdg`.
+3. Press `Ctrl+O` again to open `Staging.rdg`. Both files appear as root nodes in the connection tree.
+4. Press `Ctrl+Shift+G` to authenticate against your corporate Apache Guacamole portal. The imported hierarchy appears alongside your RDG files.
+5. All open sources and window layouts are automatically preserved in `workspace.json` for subsequent launches.
 
-### Overview
+### 2. Using Global Favorites
+1. In the tree, select any server from an `.rdg` file or Guacamole portal.
+2. Press `Ctrl+D` (or right-click and choose **Adicionar aos Favoritos**).
+3. The server appears under the **★ Favoritos** root node.
+4. Press `F2` to give the favorite a custom alias (e.g. `Primary Database`).
+5. Double-click the favorite or press `Enter` to connect directly with the correct session host.
 
-Users can authenticate directly against an Apache Guacamole server to discover data sources and import all authorized RDP endpoints. The connection hierarchy is automatically synchronized, persisted locally for offline use, and rendered in session tabs powered by Microsoft Edge WebView2.
+### 3. Fast Navigation with Quick Open (`Ctrl+P`)
+1. Press `Ctrl+P` from anywhere in the application.
+2. Type partial names or groups, e.g., `banco prod` or `bastion cloud`.
+3. Use the `Up` and `Down` arrow keys to navigate the ranked results.
+4. Press `Enter` to connect immediately, or press `Ctrl+Enter` to locate and select the server in the connection tree.
 
-### Import and Persistence Flow
+---
 
-1. **Direct Login**: Select `File > Login to Guacamole...` (`Ctrl+Shift+G`) to enter the portal URL, username, and password.
-2. **Discovery & Hierarchy Mapping**: PRDC queries the Guacamole REST API across all available data sources, extracts nested connection groups and RDP endpoints, and resolves display names and hostnames into an in-memory RDCMan document tree.
-3. **Local Cache Persistence**: The imported inventory is automatically saved to a canonical local cache at `%LOCALAPPDATA%\PRDC\Guacamole\inventory.json` using an atomic transactional pipeline (UTF-8 without BOM, hardware `WriteThrough`, integrity verification, and safe `File.Replace`).
-4. **Offline Startup**: On subsequent launches, PRDC automatically detects and loads the cached inventory from disk in milliseconds, without requiring network access, background HTTP requests, or credential prompts.
-5. **Inventory Refresh & Removal**:
-   - `File > Refresh Guacamole list` (`Ctrl+Shift+U`): Re-authenticates against the configured portal and atomically updates the local cache and connection tree.
-   - `File > Remove Guacamole inventory...`: Safely deletes the local inventory cache and resets the tree without affecting WebView2 browser profiles or active settings.
-6. **Export to RDCMan (.rdg)**:
-   - Users can optionally export the active inventory to a standalone `.rdg` file via `File > Save as...`.
-   - The local cache (`inventory.json`) is never overwritten by `Ctrl+S` or `File > Save`.
-   - During the current application run, exported connections maintain their Guacamole web session links; when reopened from disk in a future session, they behave as traditional RDCMan endpoints (`mstscax.dll`).
-7. **Session Execution via WebView2**:
-   - Guacamole connections run inside dedicated session tabs using Microsoft Edge WebView2, connecting directly to the official web client and `guacd`.
-   - Dynamic remote desktop resizing automatically adjusts display resolutions on window resize using debounced DOM sensor events without reconnecting or interrupting the tunnel.
-
-### Features
-
-- Direct login to Apache Guacamole
-- Automatic import of groups and connections
-- Local cache for offline operation
-- Manual inventory refresh (`Ctrl+Shift+U`)
-- Optional export to RDCMan (`.rdg`)
-- Remote sessions executed via Microsoft Edge WebView2
-
-### Limitations
-
-- Support is limited strictly to RDP connections; SSH and VNC connections are filtered out during import.
-- Credentials (passwords, auth tokens, session cookies, RDP passwords) are never persisted in the local cache.
-- The cache stores only necessary inventory metadata (`schemaVersion`, `savedAtUtc`, `baseUrl`, data sources, groups, and connection metadata).
-- Exported `.rdg` files are treated as traditional RDCMan documents when reopened in subsequent runs (`mstscax.dll`).
-
-## RDG compatibility and Guacamole session metadata
-
-PRDC implements the file, group, server, display-name, host-name, and expanded-state portions currently needed by the application. Unknown XML elements are retained during load/save, but full behavioral parity with every RDCMan setting is not guaranteed. See [RDG compatibility](docs/rdg-format.md).
-
-Apache Guacamole connection metadata (`BaseUri`, `DataSource`, and `ConnectionIdentifier`) exists only in memory for the current imported session and is not written to `.rdg` XML files. If you save an imported Guacamole inventory to an `.rdg` file and later reopen that `.rdg` file, the Guacamole link is not preserved: the nodes are treated as traditional `.rdg` servers (`mstscax.dll`), and direct RDP connections may fail in segmented networks where hosts are only reachable through `guacd`.
-
-Do not save or commit real `.rdg` files containing internal hostnames, usernames, encrypted credentials, or other infrastructure metadata.
-
-## Project structure
+## Project Structure
 
 ```text
 PRDC.sln
 src/PRDC/
-  MainForm.cs                      Main window and commands
-  RdgDocument.cs                   RDG XML persistence
-  RdpClientHost.cs                 Windows RDP ActiveX host
-  GuacamoleInventoryCache.cs       Local atomic cache manager for Apache Guacamole inventory
-  GuacamoleInventoryProvider.cs    Apache Guacamole RDP inventory importer
-  GuacamoleConnectionReference.cs  In-memory Guacamole connection reference and client URI builder
-  GuacamoleSessionHost.cs          WebView2 session host for Apache Guacamole connections
-  WebView2EnvironmentProvider.cs   Shared CoreWebView2Environment provider
-  GuacamoleLoginDialog.cs          Apache Guacamole credentials dialog
-  NodeDialog.cs                    Group and server editor
-  AboutDialog.cs                   Project and author information
+  MainForm.cs                      Main window, menus, tree orchestration and session tabs
+  IConnectionSource.cs             Abstraction contract for connection sources
+  RdgFileSource.cs                 RDCMan .rdg source implementation
+  GuacamoleInventorySource.cs      Apache Guacamole source implementation
+  WorkspaceManager.cs              Atomic workspace persistence and crash recovery
+  FavoriteManager.cs               Global favorites engine and orphan detection
+  FavoriteEntry.cs                 Favorite model with primary & fallback locators
+  SearchCatalogManager.cs          High-performance global search index and ranking
+  QuickOpenOverlayForm.cs          Floating quick open (Ctrl+P) modal overlay
+  SessionContext.cs                Immutable session-to-source context isolation
+  WebView2EnvironmentPool.cs       Shared pool of CoreWebView2Environment instances
+  GuacamolePortalManager.cs        Multi-portal metadata and cache manager
+  GuacamoleInventoryCache.cs       Atomic cache manager for Apache Guacamole inventory
+  RdgDocument.cs                   RDG XML document manipulation
+  RdpClientHost.cs                 Windows RDP ActiveX host with fallback cascade
+  GuacamoleSessionHost.cs          WebView2 host for Apache Guacamole sessions
+  ThemeManager.cs                  Light/Dark/System theme orchestration
 ```
 
-The main technical boundaries are documented in [Architecture](docs/architecture.md). Build and validation instructions are in [Development](docs/development.md).
+---
 
 ## Documentation
 
-- [Documentation index](docs/index.md)
+- [User Guide](docs/user-guide.md)
 - [Architecture](docs/architecture.md)
 - [Development](docs/development.md)
-- [RDG compatibility](docs/rdg-format.md)
-- [Security policy](SECURITY.md)
+- [RDG Format Compatibility](docs/rdg-format.md)
+- [Security Policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 
-## Security and privacy
-
-PRDC does not directly persist passwords, `authToken` values, cookies, or RDP credentials. For native `.rdg` connections, credential prompts are owned by the Windows RDP control (`mstscax.dll`). For Apache Guacamole sessions, WebView2 uses a local browser profile at `%LOCALAPPDATA%\PRDC\WebView2\` initialized with `--no-proxy-server`; the WebView2 profile itself may persist cookies, `localStorage` (such as `GUAC_AUTH`), cache, and site permissions across tabs and runs. Camera, microphone, geolocation, and notification permissions are denied in the MVP. Clipboard permissions remain governed by the default WebView2 policy; PRDC does not automatically grant clipboard-read access. RDG files can still contain sensitive infrastructure metadata; protect them accordingly and report vulnerabilities through the process in [SECURITY.md](SECURITY.md).
-
-## Roadmap
-
-- Additional RDG connection and display settings.
-- RD Gateway configuration.
-- Release packaging and signed binaries.
-
-Roadmap items describe intended direction, not committed release dates.
-
-## Contributing
-
-Focused issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and use the repository templates before submitting a change.
-
-## Origins and independence
-
-PRDC was initially informed by static behavioral analysis of Remote Desktop Connection Manager. The PRDC contains an independent implementation and does not distribute RDCMan or `mstscax.dll`. See [DISCLAIMER.md](DISCLAIMER.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+---
 
 ## License
 
